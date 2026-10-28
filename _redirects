@@ -1,0 +1,2 @@
+/s/:token  /service.html?token=:token  200
+/admin  /index.html  200
