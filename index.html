@@ -369,7 +369,7 @@
 </div>
 
 <header>
-  <h1>🏥 İhale Takip Programı <span style="font-size:11px;opacity:.7;font-weight:400;" id="surumEtiket" title="Yüklü sürüm — güncel değilse Ctrl+F5 ile yenileyin">v5.8</span></h1>
+  <h1>🏥 İhale Takip Programı <span style="font-size:11px;opacity:.7;font-weight:400;" id="surumEtiket" title="Yüklü sürüm — güncel değilse Ctrl+F5 ile yenileyin">v5.9</span></h1>
   <div class="hdr-right">
     <span id="kullaniciEtiket" style="font-size:11px;opacity:.85;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="Giriş yapan kullanıcı"></span>
     <span style="font-size:11px;opacity:.7;cursor:pointer;" id="kayitZaman" onclick="kaydetHemen()" title="Tıklayarak hemen kaydet"></span>
@@ -922,9 +922,12 @@ let dmoTeslimat = [];   // DMO sipariş/teslimat bilgileri (düz veritabanı sat
 /* DMO yardımcı durumları. init() bu bloktan sonra çalıştığı için burada
    tanımlanırlar (aşağıda tanımlanırsa ilk render'da TDZ hatası olur). */
 const dmoMalzemeCache = new WeakMap();  // satır nesnesi → malzeme listesi
+const dmoKodSetCache = new WeakMap();    // satır nesnesi → kod/barkod kümesi
+const dmoKayitAnahtarCache = new WeakMap(); // ihale kaydı → eşleştirme anahtarları
+const dmoPartiHaritaCache = new WeakMap();  // ihale kaydı → DMO satırı ↔ parti haritası
+const dmoOzetCache = new WeakMap();         // DMO satırı → özet alanları
 let dmoVeriSurumu = 0;                  // DMO/ihale verisi değiştiğinde artar (önbellek anahtarı)
 let dmoIhaleHaritaOnbellek = null;      // IKN → ihale malzeme haritası (barkod/kod)
-let dmoFiyatKatOnbellek = null;         // kod → bilinen birim fiyatlar
 let dmoBulOnbellek = null;              // kayıt → eşleşen DMO satırları (render başına)
 let dmoIknIndeks = null;                // İKN → DMO satırları
 let dmoIknKayitIndeks = null;           // İKN → ihale kayıtları (belirsizlik kontrolü)
@@ -1022,6 +1025,8 @@ function tasinirAnahtar(v) {
   return rakam.length >= 6 ? rakam : t;
 }
 function anaIdxleriYenile() {
+  /* Kayıt ↔ ana liste bağlantısı değişti: eşleştirme önbellekleri geçersiz. */
+  if (typeof dmoVeriGecersiz === 'function') dmoVeriGecersiz();
   const harita = {};
   anaListe.forEach((a, i) => {
     const k = tasinirAnahtar(a.tasinir);
@@ -1318,6 +1323,7 @@ function sonIslemiGeriAl() {
     mesaj = 'İD eşleşmesi geri yüklendi.';
   }
   copKaydet();
+  dmoVeriGecersiz();
   tumEkranlariYenile();
   kaydet();
   logEkle('Geri alma', 'Silme işlemi geri alındı', islem.aciklama || islem.tip, mesaj);
@@ -1691,6 +1697,7 @@ async function sunucudanYukle() {
       kurtarilan.push('dmo_teslimat');
     }
 
+    dmoVeriGecersiz();
     anaIdxleriYenile();
   } catch (err) {
     hatalar.push('Firebase okuma: ' + (err.message || err));
@@ -1711,6 +1718,7 @@ function yereldenYukle() {
     stokMap = data.stokMap || {};
     dmoTeslimat = Array.isArray(data.dmoTeslimat) ? data.dmoTeslimat : [];
     ihaleListe.forEach(h => { if (!h.partiler) h.partiler = []; });
+    dmoVeriGecersiz();
     anaIdxleriYenile();
     return true;
   } catch(e) { console.error(e); return false; }
@@ -1741,6 +1749,7 @@ function kaymisSutunlariOnar() {
     adet++;
   });
   onarimSayaci += adet;
+  if (adet) dmoVeriGecersiz();
   return adet;
 }
 
@@ -1791,6 +1800,7 @@ async function anaYukle(ev) {
     }
     setStatus(st, `✅ ${eklenen} eklendi, ${atlanan} tekrar atlandı. Toplam: ${anaListe.length}`, eklenen ? '' : 'warn');
     // Yeni eklenen malzemeler, taşınır kodu üzerinden eski ihale kayıtlarına bağlanır
+    dmoVeriGecersiz();
     const bag = anaIdxleriYenile();
     anaRender(); ihaleRender(); teslimatRender(); hafizaRender(); stokStatsRender();
     filtreSecenekleriGuncelle(); yuklenenIhaleleriRender(); raporRender();
@@ -2140,6 +2150,7 @@ async function sonucYukle(ev) {
       (cTermin >= 0 ? ` · termin okunan: ${terminOkunan}` : ' · termin sütunu yok') +
       (bagliGuncellenen ? ` · ana listeye yeni bağlanan: ${bagliGuncellenen}` : '') +
       (anaListedeYok ? ` · ana listede bulunmayan taşınır: ${anaListedeYok} satır` : ''));
+    dmoVeriGecersiz();
     anaIdxleriYenile();
     ihaleRender(); teslimatRender();
     filtreSecenekleriGuncelle();
@@ -2421,6 +2432,7 @@ function anaSil(i) {
     `${silinenIhaleler.length} bağlı ihale kaydı da silindi`);
   ihaleListe = ihaleListe.filter(h => !silinenIhaleler.includes(h));
   anaListe.splice(i, 1);
+  dmoVeriGecersiz();
   anaIdxleriYenile();
   anaRender(); ihaleRender(); teslimatRender(); hafizaRender(); stokStatsRender();
   filtreSecenekleriGuncelle(); yuklenenIhaleleriRender(); raporRender();
@@ -2844,6 +2856,7 @@ function partiSil(ihaleIdx, partiIdx) {
     partiIndex: partiIdx, parti: parti ? JSON.parse(JSON.stringify(parti)) : null
   });
   h.partiler.splice(partiIdx, 1);
+  dmoVeriGecersiz();
   logEkle('Silme', `Parti silindi (P${partiIdx + 1})`,
     logHedef(kayitAnaBilgi(h), h.ikn ? 'IKN: ' + h.ikn : ''),
     parti ? `Gelen: ${parti.gelen || 0}, Tarih: ${parti.gelisTarihi || '—'}, İrsaliye: ${parti.irsaliye || '—'}` : '');
@@ -3792,6 +3805,7 @@ function yedekDosyaYukle(ev) {
       copKaydet();
       if (Array.isArray(data.degisiklikLog)) { degisiklikLog = data.degisiklikLog; logSirala(); logYerelKaydet(); }
       ihaleListe.forEach(h => { if (!h.partiler) h.partiler = []; });
+      dmoVeriGecersiz();
       anaIdxleriYenile();
       anaRender(); ihaleRender(); teslimatRender(); hafizaRender(); stokStatsRender();
       filtreSecenekleriGuncelle();
@@ -3810,6 +3824,7 @@ function temizle() {
   if (!confirm('TÜM veriler silinecek. Emin misiniz?')) return;
   if (!confirm('Bu işlem GERİ ALINAMAZ. Devam?')) return;
   anaListe = []; ihaleListe = []; stokMap = {}; copKutusu = [];
+  dmoVeriGecersiz();
   localStorage.removeItem('ihale_takip_v5');
   localStorage.removeItem(COP_ANAHTAR);
   copButonGuncelle();
@@ -3940,6 +3955,7 @@ function topluIhaleSilByKey(key) {
     return hKey === key;
   });
   ihaleListe = ihaleListe.filter(h => !silinenler.includes(h));
+  dmoVeriGecersiz();
   const silinen = onceki - ihaleListe.length;
 
   copEkle({
@@ -4291,6 +4307,7 @@ function fbCanliDinle() {
     }
 
     anaIdxleriYenile();
+    dmoVeriGecersiz();
     anaRender(); ihaleRender(); teslimatRender(); hafizaRender(); stokStatsRender();
     filtreSecenekleriGuncelle(); yuklenenIhaleleriRender(); raporRender();
     
@@ -4481,129 +4498,129 @@ function dmoIhaleMalzemeHaritasi(ikn) {
   }
   return dmoIhaleHaritaOnbellek.harita;
 }
-/* DMO satırlarındaki kod → fiyat kataloğu. Satırların tamamı hizalıysa
-   (liste uzunlukları eşit) fiyat kesin bilgidir; tekilleştirme olmuş
-   satırlarda miktar hizalamasını doğrulamak için kullanılır. */
-function dmoFiyatKatalogu() {
-  if (dmoFiyatKatOnbellek) return dmoFiyatKatOnbellek;
+/* Malzeme kataloğu: aynı İKN içinde, malzemenin (kod) BAŞKA satırlarda
+   hizalı olarak okunabilen miktar/fiyat değerleri. İhale listesinde
+   karşılığı olmayan malzemelerde doğru değeri bulmayı sağlar.
+   Yalnızca TEK değer okunabilen malzemeler için kullanılır; birden çok
+   değer varsa yanlış miktar yazmamak için bilinmiyor sayılır. */
+let dmoKatOnbellek = null, dmoKatSurum = -1;
+function dmoKatalog() {
+  if (dmoKatOnbellek && dmoKatSurum === dmoVeriSurumu) return dmoKatOnbellek;
   const kat = new Map();
+  const anahtar = (ikn, k) => trLower(norm(ikn)).replace(/\s/g, '') + '|' + k;
+  const al = (ikn, k) => {
+    const a = anahtar(ikn, k);
+    if (!kat.has(a)) kat.set(a, { miktarlar: new Set(), fiyatlar: new Set() });
+    return kat.get(a);
+  };
   (dmoTeslimat || []).forEach(r => {
     const kodlar = dmoSatirKodListesi(r);
-    const fiyatlar = dmoListeParcala(dmoAlanDegeri(r, ['Tablo. Birim Fiyatı', 'Birim Fiyatı', 'BIRIM_FIYATI']));
-    if (!kodlar.length || kodlar.length !== fiyatlar.length) return;
-    kodlar.forEach((k, i) => {
-      const f = dmoFiyatCoz(fiyatlar[i]);
-      if (!k || !(f > 0)) return;
-      if (!kat.has(k)) kat.set(k, new Set());
-      kat.get(k).add(f);
-    });
+    if (!kodlar.length) return;
+    const mik = dmoListeParcala(dmoAlanDegeri(r, ['Tablo. Sipariş Miktarı', 'Sipariş Miktarı', 'SIPARIS_MIKTARI']));
+    const fiy = dmoListeParcala(dmoAlanDegeri(r, ['Tablo. Birim Fiyatı', 'Birim Fiyatı', 'BIRIM_FIYATI']));
+    if (kodlar.length === mik.length) {
+      kodlar.forEach((k, i) => {
+        const v = dmoAdetCoz(mik[i]);
+        if (k && v > 0) al(r.ihaleNo, k).miktarlar.add(v);
+      });
+    }
+    if (kodlar.length === fiy.length) {
+      kodlar.forEach((k, i) => {
+        const v = dmoFiyatCoz(fiy[i]);
+        if (k && v > 0) al(r.ihaleNo, k).fiyatlar.add(v);
+      });
+    }
   });
-  dmoFiyatKatOnbellek = kat;
+  dmoKatOnbellek = kat; dmoKatSurum = dmoVeriSurumu;
   return kat;
 }
-/* Tekilleştirilmiş listeleri malzemelere dağıtır (sıra korunur).
-   DMO TekSayfa çıktısı aynı değerleri bir kez yazar; bu yüzden miktar
-   listesi kod listesinden kısa olabilir. Hangi malzemenin hangi değeri
-   aldığı, ihale listesindeki miktar/fiyat (barkod ile) ve DMO'nun kendi
-   fiyat kataloğuyla çözülür. Çözülemezse değer atanmaz (0 kalır) ki
-   yanlış miktar gösterilmesin. */
-function dmoMiktarHizala(kodlar, degerler, fiyatlar, ikn, barkodlar) {
-  const n = kodlar.length, m = degerler.length;
-  const bos = new Array(n).fill('');
+/* Tekilleştirilmiş değer listelerini malzemelere dağıtır.
+   DMO TekSayfa çıktısı aynı değerleri BİR KEZ yazar; bu yüzden miktar
+   listesi kod listesinden kısa olabilir (ör. iki malzemenin miktarı da
+   "10 Adet" ise listede tek "10 Adet" kalır). Hangi malzemenin hangi
+   değeri aldığı şu sırayla çözülür:
+     1) Liste tam ise (uzunluklar eşit) sıra birebir eşleşir.
+     2) İhale listesindeki malzeme referansı (parti miktarı / birim fiyat)
+        veya malzeme kataloğu ile eşleşen değer atanır. Parti miktarları
+        tek değerliyse (P1 = P2 = 15) o değer doğrudan kullanılır; bu,
+        tekilleştirmeden etkilenmez.
+     3) Doğrulanamayan malzemeye değer YAZILMAZ (yanlış miktar göstermek
+        yerine boş bırakılır; hedef planlanan parti miktarından gelir).
+   `guvenler[i]` false ise değer, tek kalan seçenek olarak atanmıştır. */
+function dmoDegerleriHizala(kodlar, barkodlar, degerler, ikn, tip) {
+  const n = kodlar ? kodlar.length : 0;
+  const sonuc = new Array(n).fill('');
   const indeksler = new Array(n).fill(-1);
-  const kanit = new Array(n).fill(false);
-  if (!n || !m) return { degerler: bos, indeksler, kanit, guvenilir: false };
+  const guvenler = new Array(n).fill(false);
+  if (!n || !degerler || !degerler.length) return { degerler: sonuc, indeksler, guvenler };
+  const m = degerler.length;
   if (m === n) {
-    for (let i = 0; i < n; i++) { indeksler[i] = i; kanit[i] = true; }
-    return { degerler: degerler.slice(), indeksler, kanit, guvenilir: true };
+    for (let i = 0; i < n; i++) { sonuc[i] = degerler[i]; indeksler[i] = i; guvenler[i] = true; }
+    return { degerler: sonuc, indeksler, guvenler };
   }
   if (m === 1) {
-    for (let i = 0; i < n; i++) { indeksler[i] = 0; kanit[i] = true; }
-    return { degerler: new Array(n).fill(degerler[0]), indeksler, kanit, guvenilir: true };
+    for (let i = 0; i < n; i++) { sonuc[i] = degerler[0]; indeksler[i] = 0; guvenler[i] = true; }
+    return { degerler: sonuc, indeksler, guvenler };
   }
+  const cevir = tip === 'fiyat' ? dmoFiyatCoz : dmoAdetCoz;
   const ihale = dmoIhaleMalzemeHaritasi(ikn);
-  const fKat = dmoFiyatKatalogu();
-  const fiyatTam = fiyatlar.length === m;
-  const puan = (i, j) => {
-    let s = 0;
-    const kod = kodlar[i];
+  const kat = dmoKatalog();
+  const katAnahtar = k => trLower(norm(ikn)).replace(/\s/g, '') + '|' + k;
+  const kullanilan = new Set();
+  const referans = i => {
     const bar = barkodlar && barkodlar[i] ? barkodlar[i] : '';
-    const ref = ihale.kod.get(kod) || (bar ? ihale.barkod.get(bar) : null);
-    const adet = dmoAdetCoz(degerler[j]);
-    if (ref) {
-      const partiEsit = (ref.miktarlar || []).some(v => v > 0 && Math.abs(v - adet) < 0.001);
-      if (partiEsit) s += 4;
-      else if (ref.toplam > 0 && Math.abs(ref.toplam - adet) < 0.001) s += 2;
-      else if ((ref.miktarlar || []).length) s -= 4;
-      if (fiyatTam && ref.fiyat > 0) {
-        const f = dmoFiyatCoz(fiyatlar[j]);
-        if (f > 0) s += (Math.abs(ref.fiyat - f) < 0.0001) ? 3 : -3;
-      }
-    } else if (fiyatTam) {
-      const f = dmoFiyatCoz(fiyatlar[j]);
-      const bilinen = fKat.get(kod);
-      if (f > 0 && bilinen) s += bilinen.has(f) ? 2 : -2;
-    }
-    return s;
+    const ref = ihale.kod.get(kodlar[i]) || (bar ? ihale.barkod.get(bar) : null);
+    if (ref) return ref;
+    const c = kat.get(katAnahtar(kodlar[i])) || (bar ? kat.get(katAnahtar(bar)) : null);
+    if (!c) return null;
+    return {
+      miktarlar: Array.from(c.miktarlar),
+      fiyat: c.fiyatlar.size === 1 ? Array.from(c.fiyatlar)[0] : 0
+    };
   };
-  const NEG = -1e9;
-  const dp = [], yol = [], say = [];
-  for (let i = 0; i <= n; i++) {
-    dp.push(new Array(m + 1).fill(NEG));
-    yol.push(new Array(m + 1).fill(null));
-    say.push(new Array(m + 1).fill(0));
-  }
-  dp[0][0] = 0; say[0][0] = 1;
+  // 1) Referans/katalog ile doğrulanan değerler
   for (let i = 0; i < n; i++) {
-    for (let j = 0; j <= m; j++) {
-      const mevcut = dp[i][j];
-      if (mevcut === NEG) continue;
-      // kod i'ye değer atama (boş)
-      if (mevcut > dp[i + 1][j]) {
-        dp[i + 1][j] = mevcut; yol[i + 1][j] = [i, j, false]; say[i + 1][j] = say[i][j];
-      } else if (mevcut === dp[i + 1][j]) {
-        say[i + 1][j] = Math.min(2, say[i + 1][j] + say[i][j]);
-      }
-      // kod i'ye değer j ata
-      if (j < m) {
-        const yeni = mevcut + puan(i, j);
-        if (yeni > dp[i + 1][j + 1]) {
-          dp[i + 1][j + 1] = yeni; yol[i + 1][j + 1] = [i, j, true]; say[i + 1][j + 1] = say[i][j];
-        } else if (yeni === dp[i + 1][j + 1]) {
-          say[i + 1][j + 1] = Math.min(2, say[i + 1][j + 1] + say[i][j]);
-        }
-      }
+    const ref = referans(i);
+    if (!ref) continue;
+    const adaylar = tip === 'fiyat'
+      ? (ref.fiyat > 0 ? [ref.fiyat] : [])
+      : (ref.miktarlar || []).filter(v => v > 0);
+    if (!adaylar.length) continue;
+    let bulunan = -1;
+    for (let j = 0; j < m && bulunan < 0; j++) {
+      if (kullanilan.has(j)) continue;
+      const v = cevir(degerler[j]);
+      if (v > 0 && adaylar.some(a => Math.abs(a - v) < 0.0001)) bulunan = j;
+    }
+    if (bulunan >= 0) {
+      sonuc[i] = degerler[bulunan]; indeksler[i] = bulunan; guvenler[i] = true;
+      kullanilan.add(bulunan);
+      continue;
+    }
+    /* Değer listede kalmamış (tekilleştirme) ama referans TEK değerli:
+       malzemenin kendi miktarı yine de bilinir. */
+    const tekil = Array.from(new Set(adaylar.map(v => Math.round(v * 10000) / 10000)));
+    if (tip !== 'fiyat' && tekil.length === 1) {
+      sonuc[i] = tekil[0].toLocaleString('tr-TR') + ' Adet';
+      guvenler[i] = true;
     }
   }
-  if (dp[n][m] === NEG) return { degerler: bos, indeksler, kanit, guvenilir: false };
-  const skor = dp[n][m];
-  const tekCozum = say[n][m] === 1;
-  let i = n, j = m, atlanan = 0;
-  while (i > 0) {
-    const p = yol[i][j];
-    if (!p) break;
-    const [pi, pj, aldi] = p;
-    if (aldi) {
-      indeksler[pi] = pj;
-      bos[pi] = degerler[pj];
-      kanit[pi] = puan(pi, pj) > 0;
-    } else {
-      atlanan++;
+  // 2) Kalan değerler yalnızca sayı eşitse sırayla dağıtılır (tahmini ~)
+  const bosKodlar = [];
+  for (let i = 0; i < n; i++) if (!sonuc[i]) bosKodlar.push(i);
+  const kalanDegerler = [];
+  for (let j = 0; j < m; j++) if (!kullanilan.has(j)) kalanDegerler.push(j);
+  if (bosKodlar.length && bosKodlar.length === kalanDegerler.length) {
+    for (let x = 0; x < bosKodlar.length; x++) {
+      const i = bosKodlar[x], j = kalanDegerler[x];
+      sonuc[i] = degerler[j]; indeksler[i] = j;   // guvenler[i] = false → "~"
     }
-    i = pi; j = pj;
   }
-  /* Satır düzeyi güven: atlama sayısı kod-değer farkına eşit olmalı.
-     Öğe düzeyi güven: ya kendi dayanağı eşleşmeli ya da tek olası çözüm olmalı. */
-  const satirGuven = atlanan === (n - m) && skor > 0;
-  for (let x = 0; x < n; x++) {
-    if (indeksler[x] < 0) { kanit[x] = false; continue; }
-    kanit[x] = tekCozum || (kanit[x] && satirGuven);
-  }
-  return { degerler: bos, indeksler, kanit, guvenilir: satirGuven };
+  return { degerler: sonuc, indeksler, guvenler };
 }
 /* DMO sipariş satırındaki malzemeler: kod, barkod, ad, sipariş, kalan, fiyat.
-   `guvenilir` false ise sipariş/kalan miktarları tekilleştirme nedeniyle
-   belirsizdir; hedef miktar için planlanan parti miktarı kullanılmalıdır. */
+   `guvenilir` false ise sipariş/kalan değeri tekilleştirme nedeniyle
+   tahminidir; hedef miktar için planlanan parti miktarı kullanılır. */
 function dmoMalzemeListesi(r) {
   if (!r) return [];
   const cache = dmoMalzemeCache.get(r);
@@ -4617,29 +4634,22 @@ function dmoMalzemeListesi(r) {
   const fiyatlar = dmoListeParcala(dmoAlanDegeri(r, ['Tablo. Birim Fiyatı', 'Birim Fiyatı', 'BIRIM_FIYATI']));
   let liste = [];
   if (kodlar.length) {
-    const hizali = dmoMiktarHizala(kodlar, miktarlar, fiyatlar, norm(r.ihaleNo), barkodlar);
-    const al = (dizi, i) => (dizi.length === 1 && kodlar.length > 1) ? dizi[0]
-      : (dizi.length > i ? dizi[i] : '');
-    /* Fiyat ve kalan, miktarla AYNI hizalamayı kullanır; aksi hâlde
-       tabloda miktar ile fiyat farklı malzemelere ait görünür. */
-    const fiyatAyni = fiyatlar.length === miktarlar.length && miktarlar.length > 1;
-    const kalanAyni = kalanlar.length === miktarlar.length && miktarlar.length > 1;
-    const eslesenDeger = (dizi, i, ayni) => {
-      if (dizi.length === 1 && kodlar.length > 1) return dizi[0];
-      if (ayni && hizali.indeksler[i] >= 0) return dizi[hizali.indeksler[i]];
-      if (!ayni && dizi.length === kodlar.length) return dizi[i];
-      return '';
-    };
+    const ikn = norm(r.ihaleNo);
+    const hMiktar = dmoDegerleriHizala(kodlar, barkodlar, miktarlar, ikn, 'miktar');
+    const hKalan = dmoDegerleriHizala(kodlar, barkodlar, kalanlar, ikn, 'miktar');
+    const hFiyat = dmoDegerleriHizala(kodlar, barkodlar, fiyatlar, ikn, 'fiyat');
     liste = kodlar.map((k, i) => {
-      const guvenilir = !!hizali.kanit[i];
+      const guvenilir = !!hMiktar.guvenler[i];
+      const sMiktar = norm(hMiktar.degerler[i]);
       return {
         kod: String(k == null ? '' : k).replace(/[^0-9]/g, ''),
         barkod: barkodlar[i] || '',
         ad: norm(adlar[i] || ''),
-        siparis: guvenilir ? dmoAdetCoz(hizali.degerler[i]) : 0,
-        siparisMetin: guvenilir ? norm(hizali.degerler[i]) : '',
-        kalan: guvenilir ? dmoAdetCoz(eslesenDeger(kalanlar, i, kalanAyni)) : 0,
-        fiyat: guvenilir ? dmoFiyatCoz(eslesenDeger(fiyatlar, i, fiyatAyni)) : 0,
+        adAnahtar: dmoAdAnahtari(adlar[i] || ''),
+        siparis: sMiktar ? dmoAdetCoz(sMiktar) : 0,
+        siparisMetin: sMiktar,
+        kalan: hKalan.guvenler[i] ? dmoAdetCoz(hKalan.degerler[i]) : 0,
+        fiyat: dmoFiyatCoz(hFiyat.degerler[i]),
         guvenilir
       };
     }).filter(x => x.kod || x.barkod);
@@ -4653,11 +4663,30 @@ function dmoMalzemeListesi(r) {
 function dmoKodEsit(a, b) {
   const A = String(a == null ? '' : a).replace(/[^0-9]/g, '');
   const B = String(b == null ? '' : b).replace(/[^0-9]/g, '');
+  return dmoKodEsitRakam(A, B);
+}
+/* Yalnızca rakamlardan oluşan kodlar için hızlı karşılaştırma
+   (eşleştirme döngüsünde regex maliyetini kaldırır). */
+function dmoKodEsitRakam(A, B) {
   if (!A || !B) return false;
   if (A === B) return true;
   const kisa = A.length <= B.length ? A : B;
   const uzun = A.length <= B.length ? B : A;
   return kisa.length >= 6 && uzun.slice(-kisa.length) === kisa;
+}
+/* Kaydın eşleştirme anahtarları: her çağrıda yeniden normalize etmemek için
+   kayıt başına bir kez hesaplanır (eşleştirme döngüsünün en sıcak yeri). */
+function dmoKayitAnahtarlari(h) {
+  if (!h) return { kod: '', barkod: '', ad: '' };
+  const c = dmoKayitAnahtarCache.get(h);
+  if (c && c.surum === dmoVeriSurumu) return c;
+  const kod = dmoKayitKodu(h);
+  const barkod = barkodNormal(h.barkod);
+  const ad = dmoAdAnahtari(h.malzemeAdi || h.urun ||
+    (h.anaIdx >= 0 && anaListe[h.anaIdx] ? anaListe[h.anaIdx].malzeme : ''));
+  const kayit = { surum: dmoVeriSurumu, kod, barkod, ad };
+  dmoKayitAnahtarCache.set(h, kayit);
+  return kayit;
 }
 /* Bu sipariş satırında kaydın malzemesi var mı? Varsa miktar bilgisiyle döner.
    Sıra: taşınır kodu → barkod → malzeme adı. Taşınır kodu DMO'da boş
@@ -4665,22 +4694,24 @@ function dmoKodEsit(a, b) {
 function dmoSatirMalzemesi(h, r) {
   const liste = dmoMalzemeListesi(r);
   if (!liste.length) return null;
-  const kod = dmoKayitKodu(h);
-  if (kod) {
-    const m = liste.find(x => x.kod && dmoKodEsit(kod, x.kod));
-    if (m) return m;
+  const a = dmoKayitAnahtarlari(h);
+  if (a.kod) {
+    for (let i = 0; i < liste.length; i++) {
+      const x = liste[i];
+      if (x.kod && dmoKodEsitRakam(a.kod, x.kod)) return x;
+    }
   }
-  const barkod = barkodNormal(h && h.barkod);
-  if (barkod) {
-    const m = liste.find(x => x.barkod && x.barkod === barkod);
-    if (m) return m;
+  if (a.barkod) {
+    for (let i = 0; i < liste.length; i++) {
+      if (liste[i].barkod && liste[i].barkod === a.barkod) return liste[i];
+    }
   }
-  const adAnahtar = dmoAdAnahtari((h && (h.malzemeAdi || h.urun)) || (h && h.anaIdx >= 0 && anaListe[h.anaIdx] ? anaListe[h.anaIdx].malzeme : ''));
   /* Ad eşleşmesi BİREBİR olmalı: "No:8" ile "No:8.5" gibi farklı ürünler
      birbirine karışmamalı. (Kısmi eşleşme yanlış miktar gösteriyordu.) */
-  if (adAnahtar.length >= 8) {
-    const m = liste.find(x => dmoAdAnahtari(x.ad) === adAnahtar);
-    if (m) return m;
+  if (a.ad && a.ad.length >= 8) {
+    for (let i = 0; i < liste.length; i++) {
+      if (liste[i].adAnahtar === a.ad) return liste[i];
+    }
   }
   return null;
 }
@@ -4693,14 +4724,18 @@ function dmoAdAnahtari(s) {
 /* DMO siparişinin detay satırlarında bu taşınır kodu geçiyor mu?
    (dmo_eklenti "Sipariş Detay" sekmesi yüklendiyse kesin eşleşme sağlar.) */
 function dmoEkKodVar(r, kod) {
-  if (!kod || kod.replace(/[^0-9]/g, '').length < 6) return false;
+  const K = String(kod == null ? '' : kod).replace(/[^0-9]/g, '');
+  if (!K || K.length < 6) return false;
   return ((r && r.ek) || []).some(e =>
-    (e.alanlar || []).some(a => dmoKodEsit(a.v, kod)));
+    (e.alanlar || []).some(a => dmoKodEsitRakam(K, String(a.v == null ? '' : a.v).replace(/[^0-9]/g, ''))));
 }
 /* Bir DMO satırında geçen malzeme kodları ve barkodları. Aynı sipariş birden
    çok malzeme içerebildiği için, kaydın kodu/barkodu bu kümenin içinde yoksa
-   satır başka bir malzemeye aittir. */
+   satır başka bir malzemeye aittir. Sonuç satır başına önbelleklenir. */
 function dmoSatirKodlari(r) {
+  if (!r) return new Set();
+  const c = dmoKodSetCache.get(r);
+  if (c && c.surum === dmoVeriSurumu) return c.kodlar;
   const kodlar = new Set();
   const ekle = v => {
     String(v == null ? '' : v).split(/\s*\|\s*/).forEach(parca => {
@@ -4709,8 +4744,8 @@ function dmoSatirKodlari(r) {
     });
   };
   dmoMalzemeListesi(r).forEach(m => {
-    if (m && m.kod) ekle(m.kod);
-    if (m && m.barkod) ekle(m.barkod);
+    if (m && m.kod) kodlar.add(m.kod);
+    if (m && m.barkod) kodlar.add(m.barkod);
   });
   ((r && r.ek) || []).forEach(e => {
     (e.alanlar || []).forEach(a => {
@@ -4718,6 +4753,7 @@ function dmoSatirKodlari(r) {
       ekle(a.v);
     });
   });
+  dmoKodSetCache.set(r, { surum: dmoVeriSurumu, kodlar });
   return kodlar;
 }
 /* Kaydın taşınır kodu (ana listede yoksa kayıttan) */
@@ -4732,16 +4768,26 @@ function dmoKayitKodu(h) {
    Sıra: elle bağlı parti → kayda bağlı sipariş → detaydaki taşınır kodu →
    aynı İKN + firma → aynı İKN. Son ikisi tahmini eşleşmedir.
    (dmoBulOnbellek / dmoIknIndeks global state bloğunda tanımlı.) */
-/* Her render başında çağrılır: İKN indeksi ve kayıt başına sonuç önbelleği
-   sıfırlanır. 1300+ kayıt × 400 DMO satırı taraması aksi hâlde çok yavaş. */
+/* Her render başında çağrılır: yalnızca kayıt başına eşleşme sonucu
+   önbelleği temizlenir. İKN indeksleri ve ayrıştırma önbellekleri VERİ
+   DEĞİŞMEDİKÇE korunur (her render'da yeniden kurmak uygulamayı
+   yavaşlatıyordu). Veri değişiminde dmoVeriGecersiz() çağrılır. */
 function dmoBulOnbellekSifirla() {
+  dmoBulOnbellek = new Map();
+}
+/* Veri değişti (yükleme, DMO aktarımı, silme, parti girişi): tüm
+   ayrıştırma indeksleri ve önbellekleri geçersiz olur. */
+function dmoVeriGecersiz() {
   dmoVeriSurumu++;
   dmoIhaleHaritaOnbellek = null;
-  dmoFiyatKatOnbellek = null;
-  dmoBulOnbellek = new Map();
-  dmoIknIndeks = { tam: new Map(), rakam: new Map() };
+  dmoBulOnbellek = null;
+  dmoIknIndeks = null;
   dmoIknKayitIndeks = null;
-  dmoIknKayitIndeksle();
+}
+/* İKN indeksleri (DMO satırları + ihale kayıtları). Geçersizse kurulur. */
+function dmoIknIndeksleriKur() {
+  if (dmoIknIndeks) return;
+  dmoIknIndeks = { tam: new Map(), rakam: new Map() };
   (dmoTeslimat || []).forEach(r => {
     const tam = trLower(norm(r && r.ihaleNo)).replace(/\s/g, '');
     if (!tam) return;
@@ -4782,7 +4828,8 @@ function dmoAyniIknKayitlari(ikn) {
 }
 function dmoKayitlariBul(h, kaynak) {
   if (!Array.isArray(kaynak)) {
-    if (!dmoBulOnbellek) dmoBulOnbellekSifirla();
+    dmoIknIndeksleriKur();
+    if (!dmoBulOnbellek) dmoBulOnbellek = new Map();
     const onb = dmoBulOnbellek.get(h);
     if (onb) return onb;
     const sonuc = dmoKayitlariBulHam(h, null);
@@ -4891,7 +4938,6 @@ function dmoFirmalariDoldur() {
     doldurulan++;
   });
   if (doldurulan) {
-    dmoBulOnbellekSifirla();
     logEkle('Eşleşme', 'Firma bilgisi DMO siparişlerinden dolduruldu',
       doldurulan + ' ihale kaydı',
       'İhale listesinde firma alanı boş olan kayıtlara, eşleşen DMO siparişindeki tedarikçi adı yazıldı.');
@@ -5017,6 +5063,7 @@ function dmoTeslimatBirlestir(okunan, korunacak) {
     mevcut.set(r._id, r);
   });
   dmoTeslimat = Array.from(mevcut.values());
+  dmoVeriGecersiz();
   return { eklenen, guncellenen };
 }
 /* DMO sipariş/teslimat dosyasını (xlsx, xls, csv) içe aktarır. */
@@ -5038,8 +5085,8 @@ async function dmoTeslimatYukle() {
         ? confirm(`Mevcut ${dmoTeslimat.length} DMO teslimat kaydı korunsun mu?\n\nTamam = birleştir (aynı sipariş güncellenir)\nVazgeç = tüm DMO teslimat kayıtlarını yenisiyle değiştir`)
         : true;
       const { eklenen, guncellenen } = dmoTeslimatBirlestir(okunan, birlestir);
-      // DMO satırları değişti: kayıt başına eşleşme önbelleği geçersiz.
-      dmoBulOnbellekSifirla();
+      // DMO satırları değişti: ayrıştırma/eşleşme önbellekleri geçersiz.
+      dmoVeriGecersiz();
       const firmaDoldurulan = dmoFirmalariDoldur();
       const eslesen = dmoEslesmeSayisi();
 
@@ -5069,6 +5116,7 @@ function dmoTeslimatTemizle() {
   if (!confirm(`${dmoTeslimat.length} DMO teslimat kaydı silinecek. Emin misiniz?`)) return;
   const onceki = dmoTeslimat.length;
   dmoTeslimat = [];
+  dmoVeriGecersiz();
   kaydet();
   teslimatRender();
   dmoTeslimatRozetiGuncelle();
@@ -5092,8 +5140,11 @@ function dmoTeslimatExcelIndir() {
 }
 /* ℹ️ ekranında gösterilen sipariş satırı (özet alanları) */
 function dmoSatirOzet(r) {
+  if (!r) return {};
+  const c = dmoOzetCache.get(r);
+  if (c && c.surum === dmoVeriSurumu) return c.ozet;
   const bul = adlar => dmoAlanBul(r.alanlar, adlar);
-  return {
+  const ozet = {
     siparisNo: r.siparisNo || bul(DMO_ESLEME.siparisNo),
     siparisTarihi: bul(DMO_ESLEME.siparisTarihi),
     teslimatNo: r.teslimatNo || bul(DMO_ESLEME.teslimatNo),
@@ -5107,6 +5158,8 @@ function dmoSatirOzet(r) {
     birim: bul(DMO_ESLEME.birim),
     alimAdi: bul(DMO_ESLEME.alimAdi)
   };
+  dmoOzetCache.set(r, { surum: dmoVeriSurumu, ozet });
+  return ozet;
 }
 function dmoDurumRozeti(durum) {
   const d = trLower(durum);
@@ -5141,6 +5194,12 @@ function dmoSatirAlinan(h, dmoId) {
    bir siparişin miktarı kaydın TAMAMI değil, kendi partisinin miktarıdır.
    (Örn. toplam 6, 2 parti × 3 → her sipariş satırı 3 gösterir.) */
 function dmoPartiHaritasi(h, dmoSatirlari) {
+  /* Satır listesi verilmediyse sonuç kayıt başına önbelleklenir: bu fonksiyon
+     render sırasında her satır için çağrılıyor ve yeniden kurmak pahalı. */
+  if (!Array.isArray(dmoSatirlari) && h) {
+    const c = dmoPartiHaritaCache.get(h);
+    if (c && c.surum === dmoVeriSurumu) return c.harita;
+  }
   const harita = new Map();
   const partiler = (h && Array.isArray(h.partiler)) ? h.partiler : [];
   const satirlar = Array.isArray(dmoSatirlari) ? dmoSatirlari
@@ -5148,15 +5207,16 @@ function dmoPartiHaritasi(h, dmoSatirlari) {
   // 1) Kullanıcının açıkça bağladığı partiler
   partiler.forEach(p => { if (p && p.dmoId) harita.set(String(p.dmoId), p); });
   const bosSatir = satirlar.filter(r => !harita.has(String(r._id)));
-  if (!bosSatir.length) return harita;
-  // 2) Henüz bağlanmamış, miktarı olan planlanmış partiler
-  const serbest = partiler.filter(p => p && !p.dmoId && (Number(p.miktar) || 0) > 0);
-  if (!serbest.length) return harita;
-  // Tek satır varsa ya da parti sayısı satır sayısına eşitse sırayla eşle.
-  if (bosSatir.length === 1 || serbest.length === bosSatir.length) {
-    const n = Math.min(bosSatir.length, serbest.length);
-    for (let k = 0; k < n; k++) harita.set(String(bosSatir[k]._id), serbest[k]);
+  if (bosSatir.length) {
+    // 2) Henüz bağlanmamış, miktarı olan planlanmış partiler
+    const serbest = partiler.filter(p => p && !p.dmoId && (Number(p.miktar) || 0) > 0);
+    // Tek satır varsa ya da parti sayısı satır sayısına eşitse sırayla eşle.
+    if (serbest.length && (bosSatir.length === 1 || serbest.length === bosSatir.length)) {
+      const n = Math.min(bosSatir.length, serbest.length);
+      for (let k = 0; k < n; k++) harita.set(String(bosSatir[k]._id), serbest[k]);
+    }
   }
+  if (!Array.isArray(dmoSatirlari) && h) dmoPartiHaritaCache.set(h, { surum: dmoVeriSurumu, harita });
   return harita;
 }
 function dmoSatirPartisi(h, r, harita) {
@@ -5189,16 +5249,15 @@ function dmoSatirHedef(h, r, harita) {
   const id = String((r && r._id) || '');
   const p = dmoSatirPartisi(h, r, harita);
   if (p && Number(p.siparisMiktar) > 0) return Number(p.siparisMiktar);
-  // DMO'daki malzeme bazlı sipariş miktarı en doğru kaynaktır.
-  // (Tekilleştirme nedeniyle miktar belirsizse 0 döner.)
-  const dm = dmoSatirMalzemesi(h, r);
-  if (dm && dm.siparis > 0) return dm.siparis;
+  /* Kullanıcının planladığı parti miktarı bu sipariş için en doğru
+     kaynaktır (DMO TekSayfa miktarları tekilleştirebiliyor). */
   if (p && Number(p.miktar) > 0) return Number(p.miktar);
-  /* Malzeme miktarı DMO çıktısında belirsizse (aynı siparişte birden çok
-     malzeme + tekilleştirilmiş miktarlar) kullanıcının planladığı parti
-     miktarı tek doğru kaynaktır. */
+  // DMO'daki malzeme bazlı sipariş miktarı (doğrulanmışsa).
+  const dm = dmoSatirMalzemesi(h, r);
+  if (dm && dm.guvenilir && dm.siparis > 0) return dm.siparis;
   const planliPartiler = ((h && h.partiler) || []).filter(x => (Number(x.miktar) || 0) > 0);
   if (planliPartiler.length === 1) return Number(planliPartiler[0].miktar);
+  if (dm && dm.siparis > 0) return dm.siparis;
   const ekMiktar = dmoEkMiktari(h, r);
   if (ekMiktar > 0) return ekMiktar;
   // Planlanmış partisi olan kayıtta sipariş miktarı partiden gelir; bu satır
@@ -5269,6 +5328,7 @@ function dmoSiparisBagla(ihaleIdx, id) {
   const ayni = norm(h.siparisNo) === norm(r.siparisNo) && norm(h.teslimatNo) === norm(r.teslimatNo);
   h.siparisNo = ayni ? '' : r.siparisNo;
   h.teslimatNo = ayni ? '' : r.teslimatNo;
+  dmoVeriGecersiz();
   logEkle('DMO', ayni ? 'Sipariş bağı kaldırıldı' : 'Sipariş bağlandı',
     logHedef(kayitAnaBilgi(h), h.ikn ? 'IKN: ' + h.ikn : ''), r.siparisNo || id);
   kaydet();
@@ -5392,6 +5452,7 @@ function dmoTeslimKaydet(ihaleIdx, dmoId, veri) {
   const planli = Number(p.miktar) || 0;
   if (hedef !== '' && Number(hedef) > 0 && Number(hedef) !== planli) p.siparisMiktar = hedef;
   else delete p.siparisMiktar;
+  dmoVeriGecersiz();
 
   const eksik = dmoSatirEksik(h, r || { _id: dmoId });
   logEkle('Sevk', 'DMO teslim alındı',
@@ -5422,6 +5483,7 @@ function dmoTeslimAlSil(k, partiIdx) {
   const p = h.partiler[partiIdx];
   if (!confirm(`Bu teslim kaydı silinecek.\nGelen: ${p.gelen || 0} · Tarih: ${p.gelisTarihi || '—'}\n\nEmin misiniz?`)) return;
   h.partiler.splice(partiIdx, 1);
+  dmoVeriGecersiz();
   logEkle('Silme', 'DMO teslim kaydı silindi',
     logHedef(kayitAnaBilgi(h), h.ikn ? 'IKN: ' + h.ikn : ''),
     `Gelen: ${p.gelen || 0}, Tarih: ${p.gelisTarihi || '—'}`);
@@ -5437,23 +5499,28 @@ function dmoMalzemeTablosuHtml(h, r) {
   if (!liste.length) {
     return '<div style="padding:8px 10px;font-size:11.5px;color:#64748b;">Bu siparişte malzeme detayı yok.</div>';
   }
-  const kod = dmoKayitKodu(h);
+   const kod = dmoKayitKodu(h);
   const barkod = barkodNormal(h && h.barkod);
   const secili = dmoSatirMalzemesi(h, r);
   let html = `<div style="padding:8px 10px 4px;font-size:10.5px;color:#64748b;">
     Siparişteki malzemeler. Bu kaydın malzemesi <b style="color:#166534;">yeşil</b> gösterilir.
-    Miktar <b>—</b> ise DMO çıktısı aynı miktarları tekilleştirdiği için o malzemenin miktarı
-    okunamamıştır; hedef olarak planlanan parti miktarı kullanılır.
+    Miktar <b>~</b> ile yazılmışsa DMO çıktısı aynı miktarları tekilleştirdiği için sıraya göre
+    eşlenmiştir; <b>—</b> ise miktar belirlenememiştir.
   </div><div style="overflow-x:auto;"><table class="dmo-table" style="margin:0 0 6px;">
     <tr><th>#</th><th>Malzeme Kodu</th><th>Barkod</th><th>Malzeme Adı</th><th>Sipariş Miktarı</th><th>Birim Fiyat</th></tr>`;
   liste.forEach((m, i) => {
     const buMu = secili && ((m.kod && m.kod === secili.kod) || (m.barkod && m.barkod === secili.barkod));
+    const miktarHucre = m.siparis > 0
+      ? (m.guvenilir
+        ? m.siparis.toLocaleString('tr-TR')
+        : `<span title="Tekilleştirme nedeniyle sıraya göre eşlendi" style="color:#b45309;">~${m.siparis.toLocaleString('tr-TR')}</span>`)
+      : '<span style="color:#94a3b8;" title="Miktar okunamadı">—</span>';
     html += `<tr${buMu ? ' style="background:#dcfce7;font-weight:600;"' : ''}>
       <td>${i + 1}</td>
       <td style="font-family:monospace;font-size:10.5px;">${esc(m.kod) || '-'}</td>
       <td style="font-family:monospace;font-size:10.5px;">${esc(m.barkod) || '-'}</td>
       <td>${esc(m.ad) || '-'}</td>
-      <td style="text-align:right;">${m.guvenilir && m.siparis > 0 ? m.siparis.toLocaleString('tr-TR') : '<span style="color:#94a3b8;" title="Tekilleştirme nedeniyle okunamadı">—</span>'}</td>
+      <td style="text-align:right;">${miktarHucre}</td>
       <td style="text-align:right;">${m.fiyat > 0 ? Number(m.fiyat).toLocaleString('tr-TR',{minimumFractionDigits:4,maximumFractionDigits:4}) : '-'}</td>
     </tr>`;
   });
@@ -6142,6 +6209,7 @@ function dmoAktarimGeriAl(id) {
 
   // İhaleleri eski haline getir
   ihaleListe = JSON.parse(JSON.stringify(aktarim.oncekiVeriler));
+  dmoVeriGecersiz();
   anaIdxleriYenile();
   
   // Listeden çıkar
