@@ -52,7 +52,12 @@
     window._fbKullanici = user ? { uid: user.uid, email: user.email || '' } : null;
     window._fbHazir = !!user;
     if (user) console.log('✅ Giriş yapıldı:', user.email);
-    window.dispatchEvent(new CustomEvent('fb-durum', { detail: window._fbKullanici }));
+    /* Olay hem document hem window üzerinden gönderilir: ana script
+       document üzerinde dinliyor, eski sürümler window dinliyordu.
+       Böylece giriş sonrası ekran anında açılır. */
+    const olay = new CustomEvent('fb-durum', { detail: window._fbKullanici });
+    try { document.dispatchEvent(olay); } catch(e) {}
+    try { window.dispatchEvent(olay); } catch(e) {}
   });
 </script>
 <!-- FIREBASE BİTİŞ -->
@@ -364,7 +369,7 @@
 </div>
 
 <header>
-  <h1>🏥 İhale Takip Programı <span style="font-size:11px;opacity:.7;font-weight:400;" id="surumEtiket" title="Yüklü sürüm — güncel değilse Ctrl+F5 ile yenileyin">v5.6</span></h1>
+  <h1>🏥 İhale Takip Programı <span style="font-size:11px;opacity:.7;font-weight:400;" id="surumEtiket" title="Yüklü sürüm — güncel değilse Ctrl+F5 ile yenileyin">v5.7</span></h1>
   <div class="hdr-right">
     <span id="kullaniciEtiket" style="font-size:11px;opacity:.85;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="Giriş yapan kullanıcı"></span>
     <span style="font-size:11px;opacity:.7;cursor:pointer;" id="kayitZaman" onclick="kaydetHemen()" title="Tıklayarak hemen kaydet"></span>
@@ -4022,7 +4027,9 @@ async function girisFormuGonder(ev) {
     await window._fbGirisYap(email, sifre, hatirla);
     if (sifreEl) sifreEl.value = '';
     girisDurumYaz('Giriş başarılı, veriler yükleniyor...', 'ok');
-    // Ekran, fb-durum olayı geldiğinde açılır.
+    /* Ekranı olaya bırakmadan da aç: giriş başarılıysa oturum kesin açıktır.
+       (fb-durum olayı ayrıca oturumAcildi() çağırır; ikinci çağrı yok sayılır.) */
+    await oturumAcildi();
   } catch (err) {
     console.error('Giriş hatası:', err);
     girisDurumYaz(girisHataMesaji(err), 'err');
@@ -4070,18 +4077,39 @@ function kullaniciyiGoster() {
   el.title = k.email ? 'Giriş yapan kullanıcı: ' + k.email : '';
 }
 /* Giriş yapıldı: ekranı aç, verileri sunucudan yükle, canlı dinlemeyi başlat. */
-async function oturumAcildi() {
+async function oturumAcildi(kullaniciVerisi) {
   if (oturumAcik) return;
+  /* Oturum bilgisi olaydan gelmemiş olabilir (giriş formundan doğrudan
+     çağrıldığında). Sıra: olaydan gelen kullanıcı → window._fbKullanici →
+     Firebase currentUser. */
+  if (kullaniciVerisi) window._fbKullanici = kullaniciVerisi;
+  if (!window._fbKullanici && window._fb && window._fb.auth && window._fb.auth.currentUser) {
+    const u = window._fb.auth.currentUser;
+    window._fbKullanici = { uid: u.uid, email: u.email || '' };
+  }
+  if (!window._fbKullanici) return;
+  window._fbHazir = true;
   oturumAcik = true;
+  oturumIzleDurdur();
+  const btn = document.getElementById('girisBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Giriş yapılıyor...'; }
   kullaniciyiGoster();
   girisEkraniGizle();
-  await sunucuVerileriniYukle();
+  try {
+    await sunucuVerileriniYukle();
+  } catch (err) {
+    console.error('Veri yükleme hatası:', err);
+    kaydetDurum('❌ Veriler yüklenemedi: ' + (err && err.message ? err.message : err), 'err');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Giriş Yap'; }
+  }
 }
 /* Çıkış yapıldı: canlı dinlemeyi kapat, bellekteki veriyi temizle, giriş ekranına dön. */
 function oturumKapandi() {
   fbDinlemeyiDurdur();
   window._fbHazir = false;
   window._fbKullanici = null;
+  oturumIzleBaslat();
   if (!oturumAcik) { girisEkraniGoster('Devam etmek için e-posta ve şifrenizle giriş yapın.'); return; }
   oturumAcik = false;
   anaListe = []; ihaleListe = []; stokMap = {}; dmoTeslimat = []; dmoAktarimlari = [];
@@ -4143,6 +4171,34 @@ async function sunucuVerileriniYukle() {
   }
 }
 
+/* Oturum durumu yoklaması: 'fb-durum' olayı herhangi bir nedenle
+   ulaşmazsa (eski tarayıcı, olay sırası) giriş yapan kullanıcı yine de
+   içeri alınır. Çıkıştan sonra yeniden kurulur. */
+let oturumIzleTimer = null;
+function oturumIzleDurdur() {
+  if (oturumIzleTimer) { clearInterval(oturumIzleTimer); oturumIzleTimer = null; }
+}
+function oturumIzleBaslat() {
+  if (oturumIzleTimer) return;
+  let sayac = 0;
+  oturumIzleTimer = setInterval(function() {
+    sayac++;
+    if (window._fbKullanici) {
+      oturumIzleDurdur();
+      oturumAcildi();
+      return;
+    }
+    if (!window._fb) {
+      if (sayac > 150) {
+        oturumIzleDurdur();
+        girisEkraniGoster('Firebase yüklenemedi. İnternet bağlantınızı kontrol edip sayfayı yenileyin (Ctrl+F5).', 'err');
+      }
+      return;
+    }
+    if (sayac === 21) girisEkraniGoster('E-posta ve şifrenizle giriş yapın.');
+  }, 100);
+}
+
 /* ============================================================
    İLK YÜKLEME
 ============================================================ */
@@ -4164,33 +4220,19 @@ async function sunucuVerileriniYukle() {
   // Site giriş yapılmadan açılmaz.
   girisEkraniGoster('Firebase bağlantısı kuruluyor...', 'info');
 
-  // Firebase modülü (type="module") bu script'ten sonra çalışır:
-  // oturum durumu 'fb-durum' olayıyla bildirilir.
-  document.addEventListener('fb-durum', function(ev) {
+  /* Firebase modülü (type="module") oturum durumunu 'fb-durum' olayıyla
+     bildirir. Olay hem document hem window üzerinden dinlenir; giriş
+     sonrası ekranın takılı kalmasını önlemek için ayrıca durum yoklanır. */
+  const oturumOlayi = function(ev) {
     const kullanici = ev && ev.detail;
-    if (kullanici) oturumAcildi();
+    if (kullanici) oturumAcildi(kullanici);
     else oturumKapandi();
-  });
+  };
+  document.addEventListener('fb-durum', oturumOlayi);
+  window.addEventListener('fb-durum', oturumOlayi);
 
-  // Olay kaçırılırsa diye durumu ayrıca yokla (en fazla 15 sn).
-  let beklemeSayaci = 0;
-  const bekle = setInterval(function() {
-    beklemeSayaci++;
-    if (window._fbKullanici || window._fbHazir) {
-      clearInterval(bekle);
-      oturumAcildi();
-      return;
-    }
-    if (window._fb && beklemeSayaci > 20) {
-      clearInterval(bekle);
-      girisEkraniGoster('Firebase hazır. E-posta ve şifrenizle giriş yapın.');
-      return;
-    }
-    if (beklemeSayaci > 150) {
-      clearInterval(bekle);
-      girisEkraniGoster('Firebase yüklenemedi. İnternet bağlantınızı kontrol edip sayfayı yenileyin (Ctrl+F5).', 'err');
-    }
-  }, 100);
+  // Olay kaçırılırsa diye durumu sürekli yokla (giriş yapana kadar).
+  oturumIzleBaslat();
 })();
 function fbCanliDinle() {
   if (!fbHazirMi()) return;
