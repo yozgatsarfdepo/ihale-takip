@@ -8,7 +8,9 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
   import { getDatabase, ref, set, onValue, get } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-database.js";
-  import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
+  import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged,
+           setPersistence, browserLocalPersistence, browserSessionPersistence,
+           sendPasswordResetEmail } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyC8b1jIfh8rQLxCdH2RlAc3XHPGncNstls",
@@ -25,15 +27,33 @@
   const db = getDatabase(app);
   const auth = getAuth(app);
 
-  signInAnonymously(auth)
-    .then(() => { 
-      window._fbHazir = true; 
-      window.dispatchEvent(new Event('fb-hazir')); 
-      console.log("✅ Firebase bağlantısı başarılı!"); 
-    })
-    .catch(err => console.error("❌ Firebase Auth Hatası:", err));
+  /* ------------------------------------------------------------
+     E-POSTA / ŞİFRE İLE GİRİŞ
+     Anonim giriş kaldırıldı: kullanıcı e-posta + şifre ile giriş
+     yapmadan hiçbir veri okunmaz/yazılmaz. Oturum durumu
+     onAuthStateChanged ile ana sayfaya bildirilir.
+  ------------------------------------------------------------ */
+  window._fb = { db, ref, set, onValue, get, auth };
+  window._fbGirisYap = function(email, sifre, hatirla) {
+    const kalicilik = hatirla ? browserLocalPersistence : browserSessionPersistence;
+    return setPersistence(auth, kalicilik).then(function() {
+      return signInWithEmailAndPassword(auth, email, sifre);
+    });
+  };
+  window._fbCikisYap = function() { return signOut(auth); };
+  window._fbSifreSifirla = function(email) { return sendPasswordResetEmail(auth, email); };
 
-  window._fb = { db, ref, set, onValue, get };
+  onAuthStateChanged(auth, async function(user) {
+    // Eski sürümden kalan anonim oturumlar geçerli sayılmaz.
+    if (user && user.isAnonymous) {
+      try { await signOut(auth); } catch(e) {}
+      return;
+    }
+    window._fbKullanici = user ? { uid: user.uid, email: user.email || '' } : null;
+    window._fbHazir = !!user;
+    if (user) console.log('✅ Giriş yapıldı:', user.email);
+    window.dispatchEvent(new CustomEvent('fb-durum', { detail: window._fbKullanici }));
+  });
 </script>
 <!-- FIREBASE BİTİŞ -->
 <style>
@@ -285,18 +305,74 @@
     .rapor-teslimat { min-width:0 !important; font-size:8px !important; }
     .rapor-toplam td { background:#eef2ff !important; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
   }
+
+  /* ---------- GİRİŞ EKRANI ---------- */
+  #girisEkrani {
+    position: fixed; inset: 0; z-index: 20000;
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg,#1e3a5f,#2c5282); padding: 20px;
+  }
+  #girisEkrani.gizli { display: none; }
+  .giris-kutu {
+    background: #fff; border-radius: 12px; padding: 26px 24px 20px;
+    width: 100%; max-width: 360px; box-shadow: 0 18px 40px rgba(0,0,0,.35);
+  }
+  .giris-kutu .giris-logo { font-size: 30px; text-align: center; line-height: 1; }
+  .giris-kutu h2 { margin: 6px 0 2px; font-size: 17px; color: #1e3a5f; text-align: center; }
+  .giris-kutu .giris-alt { margin: 0 0 16px; font-size: 11.5px; color: #64748b; text-align: center; }
+  .giris-kutu label { display: block; font-size: 11.5px; font-weight: 600; color: #334155; margin: 10px 0 4px; }
+  .giris-kutu input[type=email], .giris-kutu input[type=password] {
+    padding: 9px 11px; border: 1px solid #cbd5e1; border-radius: 6px;
+    font-size: 13px; width: 100%; background: #fff;
+  }
+  .giris-kutu input[type=email]:focus, .giris-kutu input[type=password]:focus {
+    outline: none; border-color: #6366f1; box-shadow: 0 0 0 2px rgba(99,102,241,.15);
+  }
+  .giris-satir { display: flex; align-items: center; justify-content: space-between; margin: 10px 0 14px; gap: 8px; }
+  .giris-hatirla { display: flex !important; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 400 !important; color: #475569 !important; margin: 0 !important; }
+  .giris-hatirla input { width: auto; }
+  .giris-kutu button.link { background: none; border: 0; color: #2563eb; font-size: 11.5px; padding: 0; cursor: pointer; text-decoration: underline; }
+  .giris-kutu button[type=submit] { background: #1e3a5f; color: #fff; padding: 10px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .giris-kutu button[type=submit]:disabled { opacity: .65; cursor: default; }
+  .giris-durum { font-size: 11.5px; margin-top: 10px; min-height: 16px; text-align: center; line-height: 1.45; }
+  .giris-durum.err { color: #dc2626; }
+  .giris-durum.ok { color: #16a34a; }
+  .giris-durum.info { color: #0369a1; }
+  .giris-not { margin-top: 12px; font-size: 10.5px; color: #94a3b8; text-align: center; line-height: 1.4; }
+  @media print { #girisEkrani { display: none !important; } }
 </style>
 </head>
 <body>
 
+<div id="girisEkrani">
+  <form class="giris-kutu" onsubmit="girisFormuGonder(event)" autocomplete="on">
+    <div class="giris-logo">🏥</div>
+    <h2>İhale Takip Programı</h2>
+    <p class="giris-alt">Devam etmek için e-posta ve şifrenizle giriş yapın.</p>
+    <label for="girisEmail">E-posta</label>
+    <input type="email" id="girisEmail" autocomplete="username" required placeholder="ornek@kurum.gov.tr">
+    <label for="girisSifre">Şifre</label>
+    <input type="password" id="girisSifre" autocomplete="current-password" required placeholder="••••••••">
+    <div class="giris-satir">
+      <label class="giris-hatirla"><input type="checkbox" id="girisHatirla" checked> Beni hatırla</label>
+      <button type="button" class="link" onclick="sifreSifirlamaGonder()">Şifremi unuttum</button>
+    </div>
+    <button type="submit" id="girisBtn">Giriş Yap</button>
+    <div id="girisDurum" class="giris-durum"></div>
+    <div class="giris-not">Hesabınız yoksa sistem yöneticinizden kullanıcı oluşturmasını isteyin.</div>
+  </form>
+</div>
+
 <header>
-  <h1>🏥 İhale Takip Programı <span style="font-size:11px;opacity:.7;font-weight:400;" id="surumEtiket" title="Yüklü sürüm — güncel değilse Ctrl+F5 ile yenileyin">v5.5</span></h1>
+  <h1>🏥 İhale Takip Programı <span style="font-size:11px;opacity:.7;font-weight:400;" id="surumEtiket" title="Yüklü sürüm — güncel değilse Ctrl+F5 ile yenileyin">v5.6</span></h1>
   <div class="hdr-right">
+    <span id="kullaniciEtiket" style="font-size:11px;opacity:.85;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="Giriş yapan kullanıcı"></span>
     <span style="font-size:11px;opacity:.7;cursor:pointer;" id="kayitZaman" onclick="kaydetHemen()" title="Tıklayarak hemen kaydet"></span>
     <button class="small" onclick="yedekAl()">💾 Yedek Al</button>
     <button class="small" id="geriAlBtn" onclick="sonIslemiGeriAl()" disabled title="Geri alınacak işlem yok">↩ Geri Al</button>
     <button class="small" onclick="yedekYukle()">📂 Yedek Yükle</button>
     <button class="small" onclick="temizle()">🗑 Temizle</button>
+    <button class="small" onclick="cikisYap()" title="Oturumu kapat">🚪 Çıkış</button>
   </div>
 </header>
 
@@ -3877,6 +3953,197 @@ function yuklemeBilgiEventleri() {  ['yuklemeYil','yuklemeDonem','yuklemeAy'].fo
 }
 
 /* ============================================================
+   OTURUM / GİRİŞ EKRANI
+   Site, e-posta + şifre ile giriş yapılmadan açılmaz. Oturum
+   durumu Firebase'in onAuthStateChanged olayından (fb-durum)
+   okunur. Çıkış yapıldığında ekran kapanır ve bellekteki veriler
+   temizlenir; böylece aynı bilgisayarda başka bir kullanıcı
+   önceki kullanıcının verisini görmez.
+============================================================ */
+const SON_KULLANICI_ANAHTAR = 'ihale_takip_son_kullanici';
+let oturumAcik = false;
+let fbDinleKapat = null;
+
+function girisDurumYaz(mesaj, tur) {
+  const el = document.getElementById('girisDurum');
+  if (!el) return;
+  el.textContent = mesaj || '';
+  el.className = 'giris-durum' + (tur ? ' ' + tur : '');
+}
+function girisEkraniGoster(mesaj, tur) {
+  const ekran = document.getElementById('girisEkrani');
+  if (ekran) ekran.classList.remove('gizli');
+  const etiket = document.getElementById('kullaniciEtiket');
+  if (etiket) { etiket.textContent = ''; etiket.title = ''; }
+  girisDurumYaz(mesaj || '', tur || '');
+  const email = document.getElementById('girisEmail');
+  if (email) setTimeout(function() { try { email.focus(); } catch(e) {} }, 100);
+}
+function girisEkraniGizle() {
+  const ekran = document.getElementById('girisEkrani');
+  if (ekran) ekran.classList.add('gizli');
+  girisDurumYaz('');
+}
+function girisHataMesaji(err) {
+  const kod = (err && err.code) || '';
+  const harita = {
+    'auth/invalid-email': 'E-posta adresi geçersiz görünüyor.',
+    'auth/missing-password': 'Lütfen şifrenizi girin.',
+    'auth/wrong-password': 'E-posta veya şifre hatalı.',
+    'auth/user-not-found': 'Bu e-posta ile kayıtlı kullanıcı yok. Yöneticinizden kullanıcı oluşturmasını isteyin.',
+    'auth/invalid-credential': 'E-posta veya şifre hatalı.',
+    'auth/invalid-login-credentials': 'E-posta veya şifre hatalı.',
+    'auth/user-disabled': 'Bu kullanıcı devre dışı bırakılmış.',
+    'auth/too-many-requests': 'Çok fazla hatalı deneme yapıldı. Birkaç dakika sonra tekrar deneyin.',
+    'auth/network-request-failed': 'İnternet bağlantısı kurulamadı. Bağlantınızı kontrol edin.',
+    'auth/operation-not-allowed': 'Firebase konsolunda Email/Password giriş yöntemi etkin değil.',
+    'auth/unauthorized-domain': 'Bu alan adı yetkili değil: Firebase > Authentication > Settings > Authorized domains listesine ekleyin.',
+    'auth/api-key-not-valid': 'Firebase yapılandırması geçersiz (API anahtarı).'
+  };
+  return harita[kod] || (err && err.message) || 'Giriş yapılamadı.';
+}
+async function girisFormuGonder(ev) {
+  if (ev) ev.preventDefault();
+  const emailEl = document.getElementById('girisEmail');
+  const sifreEl = document.getElementById('girisSifre');
+  const email = norm(emailEl && emailEl.value);
+  const sifre = sifreEl ? sifreEl.value : '';
+  const hatirla = !!(document.getElementById('girisHatirla') || {}).checked;
+  const btn = document.getElementById('girisBtn');
+  if (!email || !email.includes('@')) { girisDurumYaz('Geçerli bir e-posta adresi girin.', 'err'); return; }
+  if (!sifre) { girisDurumYaz('Şifrenizi girin.', 'err'); return; }
+  if (typeof window._fbGirisYap !== 'function') {
+    girisDurumYaz('Firebase bağlantısı kurulamadı. İnternet bağlantınızı kontrol edip sayfayı yenileyin.', 'err');
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Giriş yapılıyor...'; }
+  girisDurumYaz('Giriş yapılıyor...', 'info');
+  try {
+    await window._fbGirisYap(email, sifre, hatirla);
+    if (sifreEl) sifreEl.value = '';
+    girisDurumYaz('Giriş başarılı, veriler yükleniyor...', 'ok');
+    // Ekran, fb-durum olayı geldiğinde açılır.
+  } catch (err) {
+    console.error('Giriş hatası:', err);
+    girisDurumYaz(girisHataMesaji(err), 'err');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Giriş Yap'; }
+  }
+}
+async function sifreSifirlamaGonder() {
+  const emailEl = document.getElementById('girisEmail');
+  let email = norm(emailEl && emailEl.value);
+  if (!email) email = norm(prompt('Şifre sıfırlama bağlantısı gönderilecek e-posta adresi:') || '');
+  if (!email) return;
+  if (typeof window._fbSifreSifirla !== 'function') {
+    girisDurumYaz('Firebase bağlantısı kurulamadı.', 'err');
+    return;
+  }
+  try {
+    await window._fbSifreSifirla(email);
+    girisDurumYaz('Şifre sıfırlama bağlantısı gönderildi: ' + email, 'ok');
+  } catch (err) {
+    girisDurumYaz(girisHataMesaji(err), 'err');
+  }
+}
+function cikisYap() {
+  if (!confirm('Oturumu kapatmak istiyor musunuz?')) return;
+  if (kaydetTimer) { try { kaydetHemen(); } catch(e) {} }
+  if (typeof window._fbCikisYap === 'function') {
+    window._fbCikisYap().catch(function(err) {
+      console.error('Çıkış hatası:', err);
+      oturumKapandi();
+    });
+  } else {
+    oturumKapandi();
+  }
+}
+function fbDinlemeyiDurdur() {
+  if (fbDinleKapat) { try { fbDinleKapat(); } catch(e) {} }
+  fbDinleKapat = null;
+}
+function kullaniciyiGoster() {
+  const k = window._fbKullanici || {};
+  const el = document.getElementById('kullaniciEtiket');
+  if (!el) return;
+  el.textContent = k.email ? '👤 ' + k.email : '';
+  el.title = k.email ? 'Giriş yapan kullanıcı: ' + k.email : '';
+}
+/* Giriş yapıldı: ekranı aç, verileri sunucudan yükle, canlı dinlemeyi başlat. */
+async function oturumAcildi() {
+  if (oturumAcik) return;
+  oturumAcik = true;
+  kullaniciyiGoster();
+  girisEkraniGizle();
+  await sunucuVerileriniYukle();
+}
+/* Çıkış yapıldı: canlı dinlemeyi kapat, bellekteki veriyi temizle, giriş ekranına dön. */
+function oturumKapandi() {
+  fbDinlemeyiDurdur();
+  window._fbHazir = false;
+  window._fbKullanici = null;
+  if (!oturumAcik) { girisEkraniGoster('Devam etmek için e-posta ve şifrenizle giriş yapın.'); return; }
+  oturumAcik = false;
+  anaListe = []; ihaleListe = []; stokMap = {}; dmoTeslimat = []; dmoAktarimlari = [];
+  dmoBulOnbellek = null;
+  dmoIknIndeks = null;
+  dmoIknKayitIndeks = null;
+  try {
+    anaRender(); ihaleRender(); teslimatRender(); hafizaRender(); stokStatsRender();
+    filtreSecenekleriGuncelle(); yuklenenIhaleleriRender(); raporRender();
+  } catch(e) {}
+  const kz = document.getElementById('kayitZaman');
+  if (kz) kz.textContent = '';
+  const sifreEl = document.getElementById('girisSifre');
+  if (sifreEl) sifreEl.value = '';
+  girisEkraniGoster('Oturum kapatıldı. Tekrar giriş yapın.');
+}
+/* Sunucu verilerini yükle ve ekranı tazele (giriş sonrası). */
+async function sunucuVerileriniYukle() {
+  const uid = (window._fbKullanici && window._fbKullanici.uid) || '';
+  let sonUid = '';
+  try { sonUid = localStorage.getItem(SON_KULLANICI_ANAHTAR) || ''; } catch(e) {}
+  /* Farklı bir kullanıcı giriyorsa, bu tarayıcıda kalan yerel kopya
+     yeni oturuma taşınmaz (başka kullanıcının verisi görünmesin). */
+  if (uid && sonUid && sonUid !== uid) {
+    anaListe = []; ihaleListe = []; stokMap = {}; dmoTeslimat = []; dmoAktarimlari = [];
+  }
+  if (uid) { try { localStorage.setItem(SON_KULLANICI_ANAHTAR, uid); } catch(e) {} }
+
+  let okuma = { hatalar: [], kurtarilan: [] };
+  try {
+    okuma = await sunucudanYukle();
+  } catch(e) {
+    console.warn('Sunucu bağlantı hatası:', e);
+  }
+
+  kaymisSutunlariOnar();
+  if (onarimSayaci > 0) idHafizasindanDoldur();
+  anaIdxleriYenile();
+
+  // İhale listesinde firma boş / "Değerlendirme Aşamasında" ise
+  // DMO teslimatlarındaki tedarikçi adıyla doldur.
+  if (dmoFirmalariDoldur()) kaydet();
+
+  anaRender(); ihaleRender(); teslimatRender(); hafizaRender(); stokStatsRender();
+  filtreSecenekleriGuncelle();
+  yuklenenIhaleleriRender();
+  raporRender();
+
+  if (fbHazirMi()) {
+    kaydetDurum('✅ Firebase Canlı Bağlantı Aktif', 'ok');
+    fbCanliDinle();
+  } else {
+    kaydetDurum('⚠️ Yerel mod (çevrimdışı)', 'warn');
+  }
+
+  if (okuma && okuma.kurtarilan && okuma.kurtarilan.length) {
+    kaydetDurum('⚠️ ' + okuma.kurtarilan.join(', ') + ' Firebase\'de boştu, yükleniyor...', 'warn');
+    try { await kaydetHemen(); } catch(e) {}
+  }
+}
+
+/* ============================================================
    İLK YÜKLEME
 ============================================================ */
 (async function init() {
@@ -3894,59 +4161,44 @@ function yuklemeBilgiEventleri() {  ['yuklemeYil','yuklemeDonem','yuklemeAy'].fo
   yuklemeBilgiEventleri();
   yuklemeBilgileriGuncelle();
 
-  // Firebase hazır olana kadar bekle (maksimum 5 saniye)
+  // Site giriş yapılmadan açılmaz.
+  girisEkraniGoster('Firebase bağlantısı kuruluyor...', 'info');
+
+  // Firebase modülü (type="module") bu script'ten sonra çalışır:
+  // oturum durumu 'fb-durum' olayıyla bildirilir.
+  document.addEventListener('fb-durum', function(ev) {
+    const kullanici = ev && ev.detail;
+    if (kullanici) oturumAcildi();
+    else oturumKapandi();
+  });
+
+  // Olay kaçırılırsa diye durumu ayrıca yokla (en fazla 15 sn).
   let beklemeSayaci = 0;
-  const bekle = setInterval(async () => {
-    if (window._fbHazir || beklemeSayaci > 50) {
-      clearInterval(bekle);
-      
-      let okuma = { hatalar: [], kurtarilan: [] };
-      try {
-        if (window._fbHazir) {
-          okuma = await sunucudanYukle();
-        } else {
-          console.warn('Firebase zaman aşımına uğradı, yerel veriyle devam ediliyor.');
-        }
-      } catch(e) {
-        console.warn('Sunucu bağlantı hatası:', e);
-      }
-
-      kaymisSutunlariOnar();
-      if (onarimSayaci > 0) idHafizasindanDoldur();
-      anaIdxleriYenile();
-
-      // İhale listesinde firma boş / "Değerlendirme Aşamasında" ise
-      // DMO teslimatlarındaki tedarikçi adıyla doldur.
-      if (dmoFirmalariDoldur()) kaydet();
-      
-      // Verileri ekrana bas
-      anaRender(); ihaleRender(); teslimatRender(); hafizaRender(); stokStatsRender();
-      filtreSecenekleriGuncelle();
-      yuklenenIhaleleriRender();
-      raporRender();
-
-      if (window._fbHazir) {
-        kaydetDurum('✅ Firebase Canlı Bağlantı Aktif', 'ok');
-        fbCanliDinle(); // Diğer cihazlarla canlı senkronizasyonu başlat
-      } else {
-        kaydetDurum('⚠️ Yerel mod (çevrimdışı)', 'warn');
-      }
-
-      // Sunucu boşsa ama yerel veri varsa geri yükle
-      if (okuma && okuma.kurtarilan && okuma.kurtarilan.length) {
-        kaydetDurum('⚠️ ' + okuma.kurtarilan.join(', ') + ' Firebase\'de boştu, yükleniyor...', 'warn');
-        try { await kaydetHemen(); } catch(e) {}
-      }
-    }
+  const bekle = setInterval(function() {
     beklemeSayaci++;
+    if (window._fbKullanici || window._fbHazir) {
+      clearInterval(bekle);
+      oturumAcildi();
+      return;
+    }
+    if (window._fb && beklemeSayaci > 20) {
+      clearInterval(bekle);
+      girisEkraniGoster('Firebase hazır. E-posta ve şifrenizle giriş yapın.');
+      return;
+    }
+    if (beklemeSayaci > 150) {
+      clearInterval(bekle);
+      girisEkraniGoster('Firebase yüklenemedi. İnternet bağlantınızı kontrol edip sayfayı yenileyin (Ctrl+F5).', 'err');
+    }
   }, 100);
 })();
 function fbCanliDinle() {
   if (!fbHazirMi()) return;
+  fbDinlemeyiDurdur();
   const { db, ref, onValue } = window._fb;
   let ilkAtla = true;
 
-  onValue(ref(db, FB_YOL), snap => {
+  fbDinleKapat = onValue(ref(db, FB_YOL), snap => {
     if (ilkAtla) { ilkAtla = false; return; }
     const data = snap.val();
     if (!data) return;
