@@ -842,6 +842,7 @@ let dmoTeslimat = [];   // DMO sipariş/teslimat bilgileri (düz veritabanı sat
 const dmoMalzemeCache = new WeakMap();  // satır nesnesi → malzeme listesi
 let dmoBulOnbellek = null;              // kayıt → eşleşen DMO satırları (render başına)
 let dmoIknIndeks = null;                // İKN → DMO satırları
+let dmoIknKayitIndeks = null;           // İKN → ihale kayıtları (belirsizlik kontrolü)
 let dmoRef = [];                        // modal içi satır referansları
 let dmoAktifGorunum = null;
 let dmoIsRef = [];
@@ -874,6 +875,14 @@ function trLower(s) {
     .toLowerCase().replace(/\s+/g, ' ').trim();
 }
 function norm(s) { return (s == null ? '' : String(s)).trim(); }
+/* Firma sütununda şirket adı yerine durum metni yazılabiliyor
+   ("Değerlendirme Aşamasında", "İhale İptal Edildi" gibi). Bu değerler
+   gerçek firma sayılmaz. */
+function firmaDegeriGecerliMi(s) {
+  const k = trLower(s).replace(/[^a-z0-9]/g, '');
+  if (!k) return false;
+  return !/^(degerlendirme|ihaleiptal|iptaledildi|ihalesonaerdi|ihaleyok)/.test(k);
+}
 function esc(s) {
   return (s == null ? '' : String(s))
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -1039,10 +1048,16 @@ function terminHucresi(h) {
 
 /* Yüklenen listelerde tekrar kontrolü: _key biçimi sürümler arasında
    değişebildiği için (eski: anaIdx, yeni: taşınır kodu) karşılaştırma
-   her zaman taşınır kodu + IKN + tarih + dönem bilgisinden üretilir. */
+   her zaman taşınır kodu + IKN + yıl + dönem + ay + grup bilgisinden üretilir.
+   İhale tarihi kimliğe DAHİL EDİLMEZ: aynı listeye tarih sonradan eklenirse
+   veya tarih biçimi değişirse kayıt ikinci kez eklenmesin, güncellensin. */
+function ihaleTasinirKodu(v) {
+  const t = tasinirAnahtar(v);
+  return /^\d{9,}$/.test(t) ? t.slice(-9) : t;
+}
 function ihaleEslesmeAnahtari(h) {
-  const tas = tasinirAnahtar(h.anaTasinir || (h.anaIdx >= 0 && anaListe[h.anaIdx] ? anaListe[h.anaIdx].tasinir : ''));
-  return [tas, norm(h.ikn), norm(h.tarih), norm(h.yil), norm(h.donem), norm(h.ay), norm(h.grup)].join('|');
+  const tas = ihaleTasinirKodu(h.anaTasinir || (h.anaIdx >= 0 && anaListe[h.anaIdx] ? anaListe[h.anaIdx].tasinir : ''));
+  return [tas, norm(h.ikn), norm(h.yil), norm(h.donem), norm(h.ay), norm(h.grup)].join('|');
 }
 /* ============================================================
    YAKLAŞAN / GECİKEN TESLİMAT ÖZETİ
@@ -1733,6 +1748,112 @@ function yuklemeBilgileriGuncelle() {
   }
 }
 
+/* Aynı gruptaki satırlar farklı bilgiler taşıyabilir (ör. ilk satırda firma
+   "Değerlendirme Aşamasında", sonraki satırlarda gerçek firma). Boş alanlar
+   sonraki satırlardan tamamlanır; firma için durum metinleri boş sayılır. */
+function ihaleGrubuTamamla(g, r, k) {
+  const bos = v => !norm(v);
+  const doldur = (alan, deger) => {
+    if (bos(g[alan]) && !bos(deger)) g[alan] = deger;
+  };
+  if (k.malzeme >= 0) doldur('malzemeAdi', norm(r[k.malzeme]));
+  const firma = norm(r[k.firma]);
+  if (firmaDegeriGecerliMi(firma) && !firmaDegeriGecerliMi(g.firma)) g.firma = firma;
+  if (k.urun >= 0) doldur('urun', norm(r[k.urun]));
+  if (k.fiyat >= 0) doldur('fiyat', numNorm(r[k.fiyat]));
+  if (k.talepD >= 0) doldur('talepDurum', norm(r[k.talepD]));
+  if (k.alimD >= 0) doldur('alimDurum', norm(r[k.alimD]));
+  if (k.termin >= 0) doldur('termin', tarihNorm(r[k.termin]));
+  if (k.tarih >= 0) doldur('tarih', tarihNorm(r[k.tarih]));
+  if (k.ikn >= 0) doldur('ikn', norm(r[k.ikn]));
+}
+/* Yeni dosyadaki partilerle mevcut partileri birleştirir.
+   Teslim alınmış miktar / tarih / irsaliye ve DMO sipariş bağı korunur. */
+function partileriBirlestir(mevcutPartiler, yeniPartiler) {
+  const eskiListe = Array.isArray(mevcutPartiler) ? mevcutPartiler.filter(Boolean) : [];
+  const eskiMap = new Map();
+  eskiListe.forEach(p => eskiMap.set(Number(p.no) || 0, p));
+  const sonuc = [];
+  const kullanilan = new Set();
+  (yeniPartiler || []).forEach(y => {
+    const no = Number(y && y.no) || 0;
+    const eski = eskiMap.get(no);
+    if (eski) {
+      kullanilan.add(no);
+      sonuc.push({ ...eski, no, miktar: Number(y.miktar) || 0 });
+    } else {
+      sonuc.push({ no, miktar: Number(y && y.miktar) || 0, gelen: '', gelisTarihi: '', irsaliye: '' });
+    }
+  });
+  // Yeni dosyada olmayan ama teslim alınmış / siparişe bağlanmış partiler korunur.
+  eskiListe.forEach(p => {
+    const no = Number(p.no) || 0;
+    if (kullanilan.has(no)) return;
+    if ((Number(p.gelen) || 0) > 0 || p.dmoId || norm(p.irsaliye) || norm(p.gelisTarihi)) sonuc.push(p);
+  });
+  sonuc.sort((a, b) => (Number(a.no) || 0) - (Number(b.no) || 0));
+  return sonuc;
+}
+function partilerImzasi(liste) {
+  return (liste || []).map(p => (Number(p.no) || 0) + ':' + (Number(p.miktar) || 0)).join('|');
+}
+/* Mevcut ihale kaydını yeni dosyadaki bilgilerle günceller.
+   Teslimat ilerlemesi (parti.gelen / gelisTarihi / irsaliye / dmoId) korunur.
+   Değişen alanların etiket listesini döndürür. */
+function ihaleKaydiGuncelle(mevcut, g) {
+  const degisen = [];
+  const isaretle = etiket => { if (degisen.indexOf(etiket) === -1) degisen.push(etiket); };
+  const yaz = (alan, yeni, etiket) => {
+    const y = norm(yeni);
+    if (!y || /^[-–—.]+$/.test(y)) return;  // dosyada boş/çizgi: mevcut bilgi silinmez
+    if (norm(mevcut[alan]) === y) return;
+    mevcut[alan] = yeni;
+    isaretle(etiket);
+  };
+  yaz('malzemeAdi', g.malzemeAdi, 'Malzeme Adı');
+  if (firmaDegeriGecerliMi(g.firma)) yaz('firma', g.firma, 'Firma');
+  yaz('urun', g.urun, 'Ürün');
+  yaz('fiyat', g.fiyat, 'Birim Fiyat');
+  yaz('talepDurum', g.talepDurum, 'Talep Durumu');
+  yaz('alimDurum', g.alimDurum, 'Alım Durumu');
+  yaz('termin', g.termin, 'Termin');
+  yaz('tarih', g.tarih, 'İhale Tarihi');
+  if (norm(g.dosyaAdi) && norm(mevcut.dosyaAdi) !== norm(g.dosyaAdi)) mevcut.dosyaAdi = g.dosyaAdi;
+
+  if (g.anaIdx >= 0 && anaListe[g.anaIdx]) {
+    const a = anaListe[g.anaIdx];
+    const kodu = ihaleTasinirKodu(g.anaTasinir) || ihaleTasinirKodu(a.tasinir);
+    if (mevcut.anaIdx !== g.anaIdx || ihaleTasinirKodu(mevcut.anaTasinir) !== kodu) {
+      mevcut.anaIdx = g.anaIdx;
+      mevcut.anaTasinir = g.anaTasinir || a.tasinir || '';
+      isaretle('Ana Liste Bağlantısı');
+    } else if (norm(g.anaTasinir) && norm(mevcut.anaTasinir) !== norm(g.anaTasinir)) {
+      // Aynı kod, daha okunur biçim (150-03-03-270002896) ile güncellenir.
+      mevcut.anaTasinir = g.anaTasinir;
+    }
+    if (!norm(mevcut.anaId) && norm(g.anaId)) mevcut.anaId = g.anaId;
+    if (!norm(mevcut.sutKodu) && norm(g.sutKodu)) mevcut.sutKodu = g.sutKodu;
+  }
+
+  const eskiler = Array.isArray(mevcut.partiler) ? mevcut.partiler : [];
+  const birlesik = partileriBirlestir(eskiler, g.partiler);
+  if (partilerImzasi(eskiler) !== partilerImzasi(birlesik)) {
+    mevcut.partiler = birlesik;
+    isaretle('Parti/Miktar');
+  }
+  const toplam = birlesik.reduce((s, p) => s + (Number(p.miktar) || 0), 0);
+  if ((Number(mevcut.miktar) || 0) !== toplam) {
+    mevcut.miktar = toplam;
+    if (degisen.indexOf('Parti/Miktar') === -1) isaretle('Miktar');
+  }
+  const siparisParti = birlesik.filter(p => Number(p.no) > 0).map(p => p.no).join(',');
+  if (norm(mevcut.siparisParti) !== siparisParti) {
+    mevcut.siparisParti = siparisParti;
+    isaretle('Parti/Miktar');
+  }
+  return degisen;
+}
+
 async function sonucYukle(ev) {
   const file = ev.target.files[0];
   if (!file) return;
@@ -1820,9 +1941,10 @@ async function sonucYukle(ev) {
           partiler: [] // Her parti burada toplanacak
         };
       }
-      if (!gruplar[grupKey].malzemeAdi && cMalzeme >= 0) {
-        gruplar[grupKey].malzemeAdi = norm(r[cMalzeme]);
-      }
+      ihaleGrubuTamamla(gruplar[grupKey], r, {
+        malzeme: cMalzeme, firma: cFirma, urun: cUrun, fiyat: cFiyat,
+        talepD: cTalepD, alimD: cAlimD, termin: cTermin, tarih: cTarih, ikn: cIkn
+      });
       
       // Parti numarasını al, yoksa 1 kabul et
       let partiNo = parseInt(norm(r[cParti])) || 1;
@@ -1840,33 +1962,38 @@ async function sonucYukle(ev) {
       gruplar[grupKey].toplamMiktar = gruplar[grupKey].partiler.reduce((sum, p) => sum + p.miktar, 0);
     }
 
-    // 2. Aşama: Grupları ihale listesine ekle
-    let eklenen = 0, atlanan = 0, terminOkunan = 0, terminGuncellenen = 0, bagliGuncellenen = 0;
-    const mevcutKey = new Set(ihaleListe.map(ihaleEslesmeAnahtari));
+    // 2. Aşama: Grupları ihale listesine ekle / mevcut kayıtları güncelle
+    let eklenen = 0, guncellenen = 0, degismeyen = 0;
+    let terminOkunan = 0, terminGuncellenen = 0, bagliGuncellenen = 0;
+    const alanSayaci = {};
     const mevcutHarita = {};
     ihaleListe.forEach(x => { const k = ihaleEslesmeAnahtari(x); if (!mevcutHarita[k]) mevcutHarita[k] = x; });
 
     Object.values(gruplar).forEach(g => {
-      const key = [tasinirAnahtar(g.anaTasinir), norm(g.ikn), norm(g.tarih), norm(g.yil), norm(g.donem), norm(g.ay), norm(g.grup)].join('|');
-      if (mevcutKey.has(key)) {
-        // Mevcut kayıtta eksik bilgileri (termin, malzeme adı, bağ) tamamla
-        const mevcut = mevcutHarita[key];
-        if (mevcut) {
-          if (g.termin && !mevcut.termin) { mevcut.termin = g.termin; terminGuncellenen++; }
-          if (!mevcut.malzemeAdi && g.malzemeAdi) mevcut.malzemeAdi = g.malzemeAdi;
-          if (g.anaIdx >= 0 && (mevcut.anaIdx < 0 || !anaListe[mevcut.anaIdx])) {
-            mevcut.anaIdx = g.anaIdx; mevcut.anaTasinir = g.anaTasinir;
-            mevcut.anaId = g.anaId; mevcut.sutKodu = g.sutKodu;
-            bagliGuncellenen++;
-          }
+      const key = ihaleEslesmeAnahtari(g);
+      const mevcut = mevcutHarita[key];
+      if (mevcut) {
+        /* Aynı kayıt yeniden yüklendi: yeni dosyadaki firma / durum / miktar
+           bilgileri mevcut kayda yazılır. Teslimat ilerlemesi korunur. */
+        const terminVardi = !!norm(mevcut.termin);
+        const bagliVardi = mevcut.anaIdx >= 0 && !!anaListe[mevcut.anaIdx];
+        const degisen = ihaleKaydiGuncelle(mevcut, g);
+        if (degisen.length) {
+          guncellenen++;
+          degisen.forEach(d => { alanSayaci[d] = (alanSayaci[d] || 0) + 1; });
+          if (!terminVardi && norm(mevcut.termin)) terminGuncellenen++;
+          if (!bagliVardi && mevcut.anaIdx >= 0) bagliGuncellenen++;
+          mevcut._key = key;
+        } else {
+          degismeyen++;
         }
-        atlanan++; return;
+        return;
       }
 
       // Partileri numaraya göre sırala
       g.partiler.sort((a, b) => a.no - b.no);
 
-      ihaleListe.push({
+      const kayit = {
         anaIdx: g.anaIdx,
         anaTasinir: g.anaTasinir,
         malzemeAdi: g.malzemeAdi,
@@ -1886,23 +2013,32 @@ async function sonucYukle(ev) {
         talepDurum: g.talepDurum,
         alimDurum: g.alimDurum,
         partiler: g.partiler // Teslimat takibi için hazır
-      });
+      };
+      ihaleListe.push(kayit);
+      mevcutHarita[key] = kayit;
 
-      mevcutKey.add(key);
       if (g.termin) terminOkunan++;
       eklenen++;
     });
 
+    const alanOzeti = Object.entries(alanSayaci)
+      .sort((a, b) => b[1] - a[1]).slice(0, 6)
+      .map(([alan, adet]) => `${alan}: ${adet}`).join(', ');
     const terminNot = cTermin >= 0
-      ? ` Termin okunan: ${terminOkunan}${terminGuncellenen ? ', mevcut kayıtta güncellenen: ' + terminGuncellenen : ''}.`
+      ? ` Termin okunan: ${terminOkunan}${terminGuncellenen ? ', yeni yazılan: ' + terminGuncellenen : ''}.`
       : ' (Excel\'de termin/teslim tarihi sütunu bulunamadı.)';
     const baglantiNot = anaListedeYok
       ? ` ⚠️ ${anaListedeYok} satırın taşınır kodu Ana Liste'de yok; bu malzemeler "bağlantısız" olarak eklendi.`
       : '';
-    setStatus(st, `✅ ${eklenen} ihale eklendi (gruplandırılmış), ${atlanan} tekrar atlandı.${terminNot}${baglantiNot}`);
+    const guncelNot = guncellenen
+      ? `, ${guncellenen} mevcut kayıt güncellendi${alanOzeti ? ' (' + alanOzeti + ')' : ''}`
+      : '';
+    setStatus(st, `✅ ${eklenen} ihale eklendi (gruplandırılmış)${guncelNot}, ${degismeyen} kayıt değişmedi.${terminNot}${baglantiNot}`);
     logEkle('Yükleme', 'İhale sonuç listesi yükleme', file.name,
-      `${eklenen} ihale eklendi, ${atlanan} tekrar atlandı · ${bilgi.yil} / ${bilgi.donem} / ${bilgi.ay} / ${bilgi.grup}` +
+      `${eklenen} ihale eklendi, ${guncellenen} kayıt güncellendi${alanOzeti ? ' (' + alanOzeti + ')' : ''}, ${degismeyen} kayıt değişmedi` +
+      ` · ${bilgi.yil} / ${bilgi.donem} / ${bilgi.ay} / ${bilgi.grup}` +
       (cTermin >= 0 ? ` · termin okunan: ${terminOkunan}` : ' · termin sütunu yok') +
+      (bagliGuncellenen ? ` · ana listeye yeni bağlanan: ${bagliGuncellenen}` : '') +
       (anaListedeYok ? ` · ana listede bulunmayan taşınır: ${anaListedeYok} satır` : ''));
     anaIdxleriYenile();
     ihaleRender(); teslimatRender();
@@ -3778,6 +3914,10 @@ function yuklemeBilgiEventleri() {  ['yuklemeYil','yuklemeDonem','yuklemeAy'].fo
       kaymisSutunlariOnar();
       if (onarimSayaci > 0) idHafizasindanDoldur();
       anaIdxleriYenile();
+
+      // İhale listesinde firma boş / "Değerlendirme Aşamasında" ise
+      // DMO teslimatlarındaki tedarikçi adıyla doldur.
+      if (dmoFirmalariDoldur()) kaydet();
       
       // Verileri ekrana bas
       anaRender(); ihaleRender(); teslimatRender(); hafizaRender(); stokStatsRender();
@@ -3911,9 +4051,14 @@ function dmoDegerTemizle(alanAdi, deger) {
   else if (/^\d{4}-\d{2}-\d{2}/.test(v)) v = tarihNorm(v);
   return v;
 }
+/* "Değerlendirme Aşamasında", "-" gibi firma yerine geçmeyen metinler
+   eşleştirmede firma sayılmaz; aksi hâlde aynı ihaledeki bütün siparişler
+   bu malzemeye aitmiş gibi görünür. */
 function dmoFirmaAnahtar(s) {
+  if (!firmaDegeriGecerliMi(s)) return '';
   return trLower(s).replace(/[^a-z0-9]/g, '');
 }
+function dmoFirmaGecerliMi(s) { return dmoFirmaAnahtar(s) !== ''; }
 /* DMO sipariş satırındaki malzeme listesi.
    "Tek Sayfa" (birleşik) çıktıda her satır birden çok malzeme içerir ve
    değerler " | " ile birleştirilir:
@@ -3986,6 +4131,26 @@ function dmoEkKodVar(r, kod) {
   return ((r && r.ek) || []).some(e =>
     (e.alanlar || []).some(a => dmoKodEsit(a.v, kod)));
 }
+/* Bir DMO satırında geçen malzeme kodları. Aynı sipariş birden çok malzeme
+   içerebildiği için, kaydın kodu bu kümenin içinde yoksa satır başka bir
+   malzemeye aittir. */
+function dmoSatirKodlari(r) {
+  const kodlar = new Set();
+  const ekle = v => {
+    String(v == null ? '' : v).split(/\s*\|\s*/).forEach(parca => {
+      const kod = parca.replace(/[^0-9]/g, '');
+      if (kod.length >= 6) kodlar.add(kod);
+    });
+  };
+  dmoMalzemeListesi(r).forEach(m => { if (m && m.kod) ekle(m.kod); });
+  ((r && r.ek) || []).forEach(e => {
+    (e.alanlar || []).forEach(a => {
+      if (!/malzeme\s*kod|stok\s*kod|ta[sş][iı]n[iı]r/i.test(norm(a.k))) return;
+      ekle(a.v);
+    });
+  });
+  return kodlar;
+}
 /* Kaydın taşınır kodu (ana listede yoksa kayıttan) */
 function dmoKayitKodu(h) {
   if (!h) return '';
@@ -4003,6 +4168,8 @@ function dmoKayitKodu(h) {
 function dmoBulOnbellekSifirla() {
   dmoBulOnbellek = new Map();
   dmoIknIndeks = { tam: new Map(), rakam: new Map() };
+  dmoIknKayitIndeks = null;
+  dmoIknKayitIndeksle();
   (dmoTeslimat || []).forEach(r => {
     const tam = trLower(norm(r && r.ihaleNo)).replace(/\s/g, '');
     if (!tam) return;
@@ -4014,6 +4181,32 @@ function dmoBulOnbellekSifirla() {
       dmoIknIndeks.rakam.get(rakam).push(r);
     }
   });
+}
+/* İKN → ihale kayıtları indeksi (aynı ihalede kaç malzeme var?). */
+function dmoIknKayitIndeksle() {
+  if (dmoIknKayitIndeks) return;
+  dmoIknKayitIndeks = { tam: new Map(), rakam: new Map() };
+  (ihaleListe || []).forEach(h => {
+    const tam = trLower(norm(h && h.ikn)).replace(/\s/g, '');
+    if (!tam) return;
+    if (!dmoIknKayitIndeks.tam.has(tam)) dmoIknKayitIndeks.tam.set(tam, []);
+    dmoIknKayitIndeks.tam.get(tam).push(h);
+    const rakam = tam.replace(/[^0-9]/g, '');
+    if (!rakam) return;
+    if (!dmoIknKayitIndeks.rakam.has(rakam)) dmoIknKayitIndeks.rakam.set(rakam, []);
+    dmoIknKayitIndeks.rakam.get(rakam).push(h);
+  });
+}
+/* Aynı ihale numarasına bağlı ihale kayıtları (malzemeler). */
+function dmoAyniIknKayitlari(ikn) {
+  dmoIknKayitIndeksle();
+  if (!dmoIknKayitIndeks) return [];
+  const tam = trLower(norm(ikn)).replace(/\s/g, '');
+  if (!tam) return [];
+  const rakam = tam.replace(/[^0-9]/g, '');
+  const liste = (dmoIknKayitIndeks.tam.get(tam) || []).slice();
+  (dmoIknKayitIndeks.rakam.get(rakam) || []).forEach(h => { if (liste.indexOf(h) === -1) liste.push(h); });
+  return liste;
 }
 function dmoKayitlariBul(h, kaynak) {
   if (!Array.isArray(kaynak)) {
@@ -4079,12 +4272,56 @@ function dmoKayitlariBulHam(h, kaynak) {
     });
     if (ayniFirma.length) return { satirlar: ayniFirma, tur: 'firma' };
   }
+  /* 3) Son çare: aynı ihale numarasındaki satırlar.
+     Bir ihalede birden çok malzeme olabilir. Malzeme kodu / firma ile
+     doğrulanamayan satırları bu kayda yazmak, o malzemeyi "teslim edilmiş"
+     gibi gösterir. Bu yüzden yalnızca kesin olarak bu kayda ait olabilecek
+     satırlar döndürülür; şüpheli durumda boş liste + adaylar verilir. */
+  const kodlar = new Set();
+  adaylar.forEach(r => dmoSatirKodlari(r).forEach(k => kodlar.add(k)));
+  if (kod && kodlar.size && ![...kodlar].some(k => dmoKodEsit(kod, k))) {
+    return { satirlar: [], tur: 'baskaMalzeme', adaylar };
+  }
+  if (kodlar.size > 1) return { satirlar: [], tur: 'belirsiz', adaylar };
+  if (dmoAyniIknKayitlari(h.ikn).length > 1) {
+    return { satirlar: [], tur: 'belirsiz', adaylar };
+  }
   return { satirlar: adaylar, tur: 'ihale' };
 }
 function dmoEslesmeSayisi() {
   let n = 0;
   ihaleListe.forEach(h => { if (dmoKayitlariBul(h).satirlar.length) n++; });
   return n;
+}
+/* İhale listesinde firma boş (veya "Değerlendirme Aşamasında" gibi firma
+   yerine geçmeyen bir metin) ise, eşleşen DMO siparişinin tedarikçisi yazılır.
+   Yalnızca kayda ait satırlarda TEK tedarikçi varsa uygulanır; aksi hâlde
+   yanlış firma yazmamak için dokunulmaz. */
+function dmoFirmalariDoldur() {
+  if (!dmoTeslimat.length || !ihaleListe.length) return 0;
+  dmoBulOnbellekSifirla();
+  let doldurulan = 0;
+  ihaleListe.forEach(h => {
+    if (dmoFirmaGecerliMi(h.firma)) return;
+    const b = dmoKayitlariBul(h);
+    if (!b.satirlar.length) return;
+    const firmalar = [];
+    b.satirlar.forEach(r => {
+      const f = norm(r.tedarikci);
+      if (!dmoFirmaGecerliMi(f)) return;
+      if (firmalar.indexOf(f) === -1) firmalar.push(f);
+    });
+    if (firmalar.length !== 1) return;
+    h.firma = firmalar[0];
+    doldurulan++;
+  });
+  if (doldurulan) {
+    dmoBulOnbellekSifirla();
+    logEkle('Eşleşme', 'Firma bilgisi DMO siparişlerinden dolduruldu',
+      doldurulan + ' ihale kaydı',
+      'İhale listesinde firma alanı boş olan kayıtlara, eşleşen DMO siparişindeki tedarikçi adı yazıldı.');
+  }
+  return doldurulan;
 }
 function dmoTeslimatRozetiGuncelle() {
   const eslesen = dmoTeslimat.length ? dmoEslesmeSayisi() : 0;
@@ -4226,14 +4463,21 @@ async function dmoTeslimatYukle() {
         ? confirm(`Mevcut ${dmoTeslimat.length} DMO teslimat kaydı korunsun mu?\n\nTamam = birleştir (aynı sipariş güncellenir)\nVazgeç = tüm DMO teslimat kayıtlarını yenisiyle değiştir`)
         : true;
       const { eklenen, guncellenen } = dmoTeslimatBirlestir(okunan, birlestir);
+      // DMO satırları değişti: kayıt başına eşleşme önbelleği geçersiz.
+      dmoBulOnbellekSifirla();
+      const firmaDoldurulan = dmoFirmalariDoldur();
       const eslesen = dmoEslesmeSayisi();
 
       kaydet();
       teslimatRender();
+      anaRender(); ihaleRender();
       dmoTeslimatRozetiGuncelle();
       logEkle('Yükleme', 'DMO teslimat bilgileri yüklendi', file.name,
-        `${okunan.length} satır okundu · ${eklenen} yeni, ${guncellenen} güncellendi · ${eslesen}/${ihaleListe.length} kayıt eşleşti`);
-      alert(`✅ DMO teslimat bilgileri yüklendi.\n\n• Okunan satır: ${okunan.length}\n• Yeni: ${eklenen}\n• Güncellenen: ${guncellenen}\n• Sistemdeki kayıtlarla eşleşen: ${eslesen}/${ihaleListe.length}\n\nℹ️ düğmesine basarak sipariş/teslimat detaylarını görebilirsiniz.`);
+        `${okunan.length} satır okundu · ${eklenen} yeni, ${guncellenen} güncellendi · ${eslesen}/${ihaleListe.length} kayıt eşleşti` +
+        (firmaDoldurulan ? ` · ${firmaDoldurulan} kayda firma yazıldı` : ''));
+      alert(`✅ DMO teslimat bilgileri yüklendi.\n\n• Okunan satır: ${okunan.length}\n• Yeni: ${eklenen}\n• Güncellenen: ${guncellenen}\n• Sistemdeki kayıtlarla eşleşen: ${eslesen}/${ihaleListe.length}\n` +
+        (firmaDoldurulan ? `• Firma bilgisi yazılan kayıt: ${firmaDoldurulan}\n` : '') +
+        `\nℹ️ düğmesine basarak sipariş/teslimat detaylarını görebilirsiniz.`);
     } catch (err) {
       alert('❌ ' + err.message);
       console.error(err);
@@ -4682,6 +4926,31 @@ function tarihYaz(d) {
   if (!(d instanceof Date) || isNaN(d.getTime())) return '';
   return `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}.${d.getFullYear()}`;
 }
+/* Eşleşmesi doğrulanamayan siparişler: kullanıcı doğru satırı elle bağlar. */
+function dmoAdaySatirlariHtml(ihaleIdx, h, adaylar) {
+  if (!Array.isArray(adaylar) || !adaylar.length) return '';
+  let html = `<div style="padding:10px;"><div class="dmo-uyari" style="margin-bottom:8px;">
+    Aynı ihale numarasında <b>${adaylar.length}</b> sipariş var; hangisinin bu malzemeye ait olduğu
+    malzeme kodu / firma ile doğrulanamadı. Doğru siparişi <b>🔗 Bağla</b> ile seçin
+    (bağlanan sipariş yalnızca bu malzemede görünür).
+  </div><div style="overflow-x:auto;"><table class="dmo-table">
+    <tr><th>#</th><th>Sipariş No</th><th>Tedarikçi</th><th>Malzeme Kodu</th><th>Son Teslim</th><th>Durum</th><th>İşlem</th></tr>`;
+  adaylar.slice(0, 80).forEach((r, n) => {
+    const o = dmoSatirOzet(r);
+    const kodlar = Array.from(dmoSatirKodlari(r)).slice(0, 4).join(', ');
+    html += `<tr>
+      <td>${n + 1}</td>
+      <td style="font-family:monospace;font-size:10.5px;">${esc(o.siparisNo) || '-'}</td>
+      <td>${esc(o.tedarikci) || '-'}</td>
+      <td style="font-family:monospace;font-size:10.5px;">${esc(kodlar) || '-'}</td>
+      <td style="white-space:nowrap;">${esc(o.sonTeslimat) || '-'}</td>
+      <td>${dmoDurumRozeti(o.durum)}</td>
+      <td><button class="dmo-btn" onclick="dmoSiparisBagla(${ihaleIdx}, '${String(r._id).replace(/'/g, "\\'")}')">🔗 Bağla</button></td>
+    </tr>`;
+  });
+  html += `</table></div></div>`;
+  return html;
+}
 function dmoDetayHtml(ihaleIdx, h, a) {
   const bulunan = dmoKayitlariBul(h);
   const termin = terminTarihi(h);
@@ -4708,6 +4977,9 @@ function dmoDetayHtml(ihaleIdx, h, a) {
       <span class="dmo-say">${bulunan.satirlar.length ? bulunan.satirlar.length + ' satır' : 'kayıt yok'}${
         bulunan.tur === 'firma' ? ' · firma eşleşmesi' :
         bulunan.tur === 'bagli' ? ' · bağlı sipariş' :
+        bulunan.tur === 'kod' ? ' · malzeme kodu eşleşmesi' :
+        bulunan.tur === 'belirsiz' ? ' · malzeme doğrulanamadı' :
+        bulunan.tur === 'baskaMalzeme' ? ' · farklı malzeme' :
         bulunan.tur === 'ihale' ? ' · aynı ihale (firma eşleşmedi)' : ''}</span>
     </div>`;
 
@@ -4718,10 +4990,16 @@ function dmoDetayHtml(ihaleIdx, h, a) {
       <b>🚚 DMO Teslimat Aktar</b> ile yükleyin.
     </div></div>`;
   } else if (!bulunan.satirlar.length) {
+    const neden = bulunan.tur === 'belirsiz'
+      ? 'Aynı ihale numarasında birden çok malzeme/sipariş var; hangisinin bu malzemeye ait olduğu doğrulanamadı. Aşağıdaki listeden doğru siparişi bağlayabilirsiniz.'
+      : bulunan.tur === 'baskaMalzeme'
+        ? 'Bu ihale numarasındaki siparişler farklı malzemelere ait; bu malzeme için sipariş bulunamadı.'
+        : 'Bu kayıtla eşleşen DMO siparişi bulunamadı.';
     html += `<div style="padding:10px;"><div class="dmo-uyari">
-      Bu kayıtla eşleşen DMO siparişi bulunamadı.<br>
+      ${neden}<br>
       Aranan İhale No: <b>${esc(h.ikn) || '-'}</b>${h.firma ? ' · Firma: <b>' + esc(h.firma) + '</b>' : ''}
     </div></div>`;
+    html += dmoAdaySatirlariHtml(ihaleIdx, h, bulunan.adaylar);
   } else {
     html += dmoSiparisTablosuHtml(ihaleIdx, h, bulunan);
     const siparissiz = dmoSiparissizPartiler(h);
@@ -5183,8 +5461,14 @@ function dmoMalzemeGoster(anaIdx) {
           Termin: <b>${tarihYaz(terminTarihi(h)) || '—'}</b> ${terminHucresi(h)}
         </div>`;
       if (!bulunan.satirlar.length) {
+        const neden = bulunan.tur === 'belirsiz'
+          ? 'Aynı ihale numarasında birden çok malzeme var; hangi siparişin bu malzemeye ait olduğu doğrulanamadı.'
+          : bulunan.tur === 'baskaMalzeme'
+            ? 'Bu ihale numarasındaki siparişler farklı malzemelere ait.'
+            : 'Bu ihale kaydıyla eşleşen DMO siparişi bulunamadı.';
         html += `<div style="padding:8px 10px;"><div class="dmo-uyari" style="margin:0;">
-          Bu ihale kaydıyla eşleşen DMO siparişi bulunamadı.
+          ${neden} Doğru siparişi seçmek için kaydı açıp <b>🔗 Bağla</b> düğmesini kullanın.
+          <div style="margin-top:6px;"><button class="dmo-btn" onclick="dmoDetayGoster(${i})">ℹ️ Kaydı aç</button></div>
         </div></div>`;
       } else {
         html += dmoSiparisTablosuHtml(i, h, bulunan);
