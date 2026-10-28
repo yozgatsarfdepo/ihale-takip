@@ -369,7 +369,7 @@
 </div>
 
 <header>
-  <h1>🏥 İhale Takip Programı <span style="font-size:11px;opacity:.7;font-weight:400;" id="surumEtiket" title="Yüklü sürüm — güncel değilse Ctrl+F5 ile yenileyin">v5.7</span></h1>
+  <h1>🏥 İhale Takip Programı <span style="font-size:11px;opacity:.7;font-weight:400;" id="surumEtiket" title="Yüklü sürüm — güncel değilse Ctrl+F5 ile yenileyin">v5.8</span></h1>
   <div class="hdr-right">
     <span id="kullaniciEtiket" style="font-size:11px;opacity:.85;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="Giriş yapan kullanıcı"></span>
     <span style="font-size:11px;opacity:.7;cursor:pointer;" id="kayitZaman" onclick="kaydetHemen()" title="Tıklayarak hemen kaydet"></span>
@@ -562,6 +562,7 @@
                 <th class="sirali" data-tablo="ihale" data-sira="id" onclick="tabloSirala('ihale','id')">İD</th>
                 <th class="sirali" data-tablo="ihale" data-sira="malzeme" onclick="tabloSirala('ihale','malzeme')">Malzeme Tanımı</th>
                 <th class="sirali" data-tablo="ihale" data-sira="tasinir" onclick="tabloSirala('ihale','tasinir')">Taşınır Kodu</th>
+                <th class="sirali" data-tablo="ihale" data-sira="barkod" onclick="tabloSirala('ihale','barkod')" title="Alımı yapılan ürünün barkodu (DMO eşleştirmesinde kullanılır)">Barkod</th>
                 <th class="sirali" data-tablo="ihale" data-sira="yil" onclick="tabloSirala('ihale','yil')">Yıl</th>
                 <th class="sirali" data-tablo="ihale" data-sira="donem" onclick="tabloSirala('ihale','donem')">Dönem</th>
                 <th class="sirali" data-tablo="ihale" data-sira="ay" onclick="tabloSirala('ihale','ay')">Ay</th>
@@ -921,6 +922,9 @@ let dmoTeslimat = [];   // DMO sipariş/teslimat bilgileri (düz veritabanı sat
 /* DMO yardımcı durumları. init() bu bloktan sonra çalıştığı için burada
    tanımlanırlar (aşağıda tanımlanırsa ilk render'da TDZ hatası olur). */
 const dmoMalzemeCache = new WeakMap();  // satır nesnesi → malzeme listesi
+let dmoVeriSurumu = 0;                  // DMO/ihale verisi değiştiğinde artar (önbellek anahtarı)
+let dmoIhaleHaritaOnbellek = null;      // IKN → ihale malzeme haritası (barkod/kod)
+let dmoFiyatKatOnbellek = null;         // kod → bilinen birim fiyatlar
 let dmoBulOnbellek = null;              // kayıt → eşleşen DMO satırları (render başına)
 let dmoIknIndeks = null;                // İKN → DMO satırları
 let dmoIknKayitIndeks = null;           // İKN → ihale kayıtları (belirsizlik kontrolü)
@@ -1520,6 +1524,7 @@ function ihaleSatirObj(h) {
     yil: h.yil ?? '', donem: h.donem ?? '', ay: h.ay ?? '', grup: h.grup ?? '',
     dosyaAdi: h.dosyaAdi ?? '', siparisParti: h.siparisParti ?? '', miktar: h.miktar ?? '',
     ikn: h.ikn ?? '', tarih: h.tarih ?? '', firma: h.firma ?? '', urun: h.urun ?? '',
+    barkod: h.barkod ?? '',
     fiyat: h.fiyat ?? '', talepDurum: h.talepDurum ?? '', alimDurum: h.alimDurum ?? '',
     termin: h.termin ?? '',
     partiler: JSON.stringify(h.partiler || [])
@@ -1653,7 +1658,13 @@ async function sunucudanYukle() {
     if (Array.isArray(data.ihale_liste) && doluSatirlar(data.ihale_liste).length) {
       ihaleListe = doluSatirlar(data.ihale_liste)
         .filter(h => h.anaTasinir || h.ikn || h.miktar || h.firma || h._key)
-        .map(h => ({ ...h, anaIdx: -1, partiler: partilerOku(h.partiler) }));
+        .map(h => ({
+          ...h, anaIdx: -1,
+          partiler: partilerOku(h.partiler),
+          /* Eski kayıtlarda barkod ayrı tutulmuyordu; "Alımı Yapılan Ürün"
+             hücresinden ("ürün - barkod - marka") türetilir. */
+          barkod: barkodNormal(h.barkod) || barkodCoz(h.urun)
+        }));
     } else if (ihaleListe.length) {
       kurtarilan.push('ihale_liste');
     }
@@ -1840,7 +1851,10 @@ function ihaleGrubuTamamla(g, r, k) {
   if (k.malzeme >= 0) doldur('malzemeAdi', norm(r[k.malzeme]));
   const firma = norm(r[k.firma]);
   if (firmaDegeriGecerliMi(firma) && !firmaDegeriGecerliMi(g.firma)) g.firma = firma;
-  if (k.urun >= 0) doldur('urun', norm(r[k.urun]));
+  if (k.urun >= 0) {
+    doldur('urun', norm(r[k.urun]));
+    if (bos(g.barkod)) g.barkod = barkodCoz(norm(r[k.urun]));
+  }
   if (k.fiyat >= 0) doldur('fiyat', numNorm(r[k.fiyat]));
   if (k.talepD >= 0) doldur('talepDurum', norm(r[k.talepD]));
   if (k.alimD >= 0) doldur('alimDurum', norm(r[k.alimD]));
@@ -1894,6 +1908,10 @@ function ihaleKaydiGuncelle(mevcut, g) {
   yaz('malzemeAdi', g.malzemeAdi, 'Malzeme Adı');
   if (firmaDegeriGecerliMi(g.firma)) yaz('firma', g.firma, 'Firma');
   yaz('urun', g.urun, 'Ürün');
+  if (barkodNormal(g.barkod) && norm(mevcut.barkod) !== norm(g.barkod)) {
+    mevcut.barkod = g.barkod;
+    isaretle('Barkod');
+  }
   yaz('fiyat', g.fiyat, 'Birim Fiyat');
   yaz('talepDurum', g.talepDurum, 'Talep Durumu');
   yaz('alimDurum', g.alimDurum, 'Alım Durumu');
@@ -2088,6 +2106,7 @@ async function sonucYukle(ev) {
         ikn: g.ikn,
         tarih: g.tarih,
         termin: g.termin,
+        barkod: g.barkod || '',
         firma: g.firma,
         urun: g.urun,
         fiyat: g.fiyat,
@@ -2520,6 +2539,7 @@ function ihaleRender() {
     if (alan === 'id') return s.ana.id;
     if (alan === 'malzeme') return s.ana.malzeme;
     if (alan === 'tasinir') return s.ana.tasinir;
+    if (alan === 'barkod') return s.ihale ? s.ihale.barkod : '';
     if (alan === 'talepMiktar') return s.ana.talepMiktar;
     if (alan === 'tarih') { const t = tarihDeger(s.ihale && s.ihale.tarih); return t ? t.getTime() : ''; }
     return s.ihale ? s.ihale[alan] : '';
@@ -2555,6 +2575,7 @@ function ihaleRender() {
       <td>${esc(a.id) || '<span style="color:#dc2626;">YOK</span>'}</td>
       <td>${esc(a.malzeme)}${s.baglantisiz ? ' <span class="badge no" title="Taşınır kodu Ana Liste\'de yok. Ana listeye eklenirse otomatik bağlanır.">bağlantısız</span>' : ''}</td>
       <td style="font-family:monospace;font-size:11px;">${esc(a.tasinir)}</td>
+      <td style="font-family:monospace;font-size:10.5px;color:#475569;">${h ? esc(h.barkod || '') : ''}</td>
       <td>${h ? `<span class="badge info">${esc(h.yil)}</span>` : ''}</td>
       <td>${h ? `<span class="badge period">${esc(h.donem)}</span>` : ''}</td>
       <td>${h ? `<span class="badge group">${esc(h.ay)}</span>` : ''}</td>
@@ -2571,7 +2592,7 @@ function ihaleRender() {
     tbody.appendChild(tr);
   });
   if (goster === 0) {
-    tbody.innerHTML = `<tr><td colspan="16"><div class="empty-state"><h3>Kayıt yok</h3></div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="17"><div class="empty-state"><h3>Kayıt yok</h3></div></td></tr>`;
   }
   document.getElementById('ihaleAdetBadge').textContent = ihaleListe.length + ' ihale satırı';
   const baglantisiz = baglantisizIhaleSayisi();
@@ -2900,7 +2921,7 @@ function ihaleExcelIndir() {
     const ihaleler = ihaleListe.filter(x => x.anaIdx === i);
     if (ihaleler.length === 0) {
       satirlar.push({
-        'Malzeme Tanımı': a.malzeme, 'Sut Kodu': a.sut, 'Taşınır Kodu': a.tasinir, 'İD': a.id,
+        'Malzeme Tanımı': a.malzeme, 'Sut Kodu': a.sut, 'Taşınır Kodu': a.tasinir, 'Barkod': '', 'İD': a.id,
         'Yıl': '', 'Dönem': '', 'Ay': '', 'Grup': '',
         'Talep Miktarı': a.talepMiktar, 'Onay Miktarı': a.onayMiktar,
         'Sipariş Parti': '', 'Miktar': '', 'IKN': '', 'İhale Tarihi': '',
@@ -2908,7 +2929,8 @@ function ihaleExcelIndir() {
       });
     } else {
       ihaleler.forEach(h => satirlar.push({
-        'Malzeme Tanımı': a.malzeme, 'Sut Kodu': a.sut, 'Taşınır Kodu': a.tasinir, 'İD': a.id,
+        'Malzeme Tanımı': a.malzeme, 'Sut Kodu': a.sut, 'Taşınır Kodu': a.tasinir,
+        'Barkod': h.barkod || '', 'İD': a.id,
         'Yıl': h.yil, 'Dönem': h.donem, 'Ay': h.ay, 'Grup': h.grup,
         'Talep Miktarı': a.talepMiktar, 'Onay Miktarı': a.onayMiktar,
         'Sipariş Parti': h.siparisParti, 'Miktar': h.miktar, 'IKN': h.ikn,
@@ -3715,7 +3737,7 @@ function raporExcelIndir() {
       const degisim = raporFiyatDegisimi(h, onceki);
       const row = {
         'Malzeme Tanımı': a.malzeme || '', 'SUT Kodu': a.sut || '',
-        'Taşınır Kodu': a.tasinir || '', 'İD': a.id || '',
+        'Taşınır Kodu': a.tasinir || '', 'Barkod': h.barkod || '', 'İD': a.id || '',
         'Yıl': h.yil || '', 'Dönem': h.donem || '', 'Ay': h.ay || '', 'Grup': h.grup || '',
         'IKN': h.ikn || '', 'İhale Tarihi': h.tarih || '',
         'Alım Yapılan Firma': h.firma || '', 'Alınan Ürün': h.urun || '',
@@ -4248,7 +4270,11 @@ function fbCanliDinle() {
     if (Array.isArray(data.ana_liste)) anaListe = doluSatirlar(data.ana_liste);
     if (Array.isArray(data.ihale_liste)) {
       ihaleListe = doluSatirlar(data.ihale_liste)
-        .map(h => ({ ...h, anaIdx: -1, partiler: partilerOku(h.partiler) }));
+        .map(h => ({
+          ...h, anaIdx: -1,
+          partiler: partilerOku(h.partiler),
+          barkod: barkodNormal(h.barkod) || barkodCoz(h.urun)
+        }));
     }
     if (Array.isArray(data.stok_map)) {
       stokMap = {};
@@ -4368,36 +4394,257 @@ function dmoAdetCoz(v) {
   const n = parseFloat(t);
   return isNaN(n) ? 0 : n;
 }
+/* " | " ile birleştirilmiş hücreyi listeye çevirir.
+   Boş parçalar KORUNUR: konum eşleşmesi bunlara dayanır. */
+function dmoListeParcala(v) {
+  const s = norm(v);
+  if (!s) return [];
+  return s.split(/\s*\|\s*/).map(p => p.trim());
+}
+/* "Alımı Yapılan Ürün" hücresinden barkodu çıkarır:
+     "Anestezi Maskesi, Pvc, No:3 - 8682744703328 - MEDISIN" → 8682744703328
+   Ürün adındaki "No:3", "2.40MM" gibi sayılar barkod sayılmaz:
+   yalnızca 8-14 haneli, tek parça sayı grupları kabul edilir. */
+function barkodCoz(metin) {
+  const s = norm(metin);
+  if (!s) return '';
+  const parcalar = s.split(/\s*[-–—]\s*/);
+  for (const p of parcalar) {
+    const t = p.replace(/\s/g, '');
+    if (/^\d{8,14}$/.test(t)) return t;
+  }
+  const m = s.match(/(?:^|\D)(\d{8,14})(?:\D|$)/);
+  return m ? m[1] : '';
+}
+function barkodNormal(v) {
+  const s = String(v == null ? '' : v).replace(/[^0-9]/g, '');
+  return s.length >= 8 ? s : '';
+}
+/* Birim fiyat çözümleme. DMO fiyatları "54.7925 ₺", "8.585 ₺" biçiminde
+   gelir: nokta ONDALIK ayırıcıdır. Hem virgül hem nokta varsa son görülen
+   ondalık kabul edilir ("1.234,56" / "1,234.56"). */
+function dmoFiyatCoz(v) {
+  let s = String(v == null ? '' : v).replace(/[^\d.,]/g, '');
+  if (!s) return 0;
+  const nokta = s.lastIndexOf('.'), virgul = s.lastIndexOf(',');
+  if (virgul > nokta) s = s.replace(/\./g, '').replace(',', '.');
+  else if (nokta > virgul && virgul >= 0) s = s.replace(/,/g, '');
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+/* Bir DMO satırındaki malzemelerin kod listesi. */
+function dmoSatirKodListesi(r) {
+  return dmoListeParcala(dmoAlanDegeri(r, ['Tablo. Malzeme Kodu', 'Malzeme Kodu', 'MALZEME_KODU']))
+    .map(k => String(k).replace(/[^0-9]/g, ''));
+}
+function dmoAlanDegeri(r, adlar) {
+  const alanlar = (r && r.alanlar) || [];
+  for (const ad of adlar) {
+    const hedef = trLower(ad);
+    const f = alanlar.find(a => trLower(a.k) === hedef);
+    if (f && norm(f.v)) return norm(f.v);
+  }
+  for (const ad of adlar) {
+    const hedef = trLower(ad);
+    const f = alanlar.find(a => trLower(a.k).includes(hedef));
+    if (f && norm(f.v)) return norm(f.v);
+  }
+  return '';
+}
+/* İhale listesinden (aynı IKN) malzeme bazlı referans haritası.
+   Barkod ve taşınır kodu ile aranır; DMO çıktısındaki miktar sırasını
+   doğrulamak için kullanılır. */
+function dmoIhaleMalzemeHaritasi(ikn) {
+  if (!dmoIhaleHaritaOnbellek || dmoIhaleHaritaOnbellek.ikn !== ikn) {
+    const harita = { kod: new Map(), barkod: new Map() };
+    const anahtar = trLower(norm(ikn)).replace(/\s/g, '');
+    (ihaleListe || []).forEach(h => {
+      if (!anahtar) return;
+      if (trLower(norm(h.ikn)).replace(/\s/g, '') !== anahtar) return;
+      /* Parti miktarları: DMO'daki "Sipariş Miktarı" sipariş (parti) bazlıdır,
+         kaydın toplam miktarı değil. Bu yüzden parti miktarları saklanır. */
+      const partiMiktarlari = ((h.partiler || [])
+        .map(p => Number(p.miktar) || 0)
+        .filter(v => v > 0));
+      const kayit = {
+        miktarlar: partiMiktarlari.length ? partiMiktarlari : [(Number(h.miktar) || 0)],
+        toplam: Number(h.miktar) || 0,
+        fiyat: Number(h.fiyat) || 0,
+        ad: norm(h.malzemeAdi || h.urun),
+        barkod: norm(h.barkod)
+      };
+      const kod = ihaleTasinirKodu(h.anaTasinir || (h.anaIdx >= 0 && anaListe[h.anaIdx] ? anaListe[h.anaIdx].tasinir : ''));
+      if (kod) harita.kod.set(kod, kayit);
+      if (kayit.barkod) harita.barkod.set(kayit.barkod, kayit);
+    });
+    dmoIhaleHaritaOnbellek = { ikn, harita };
+  }
+  return dmoIhaleHaritaOnbellek.harita;
+}
+/* DMO satırlarındaki kod → fiyat kataloğu. Satırların tamamı hizalıysa
+   (liste uzunlukları eşit) fiyat kesin bilgidir; tekilleştirme olmuş
+   satırlarda miktar hizalamasını doğrulamak için kullanılır. */
+function dmoFiyatKatalogu() {
+  if (dmoFiyatKatOnbellek) return dmoFiyatKatOnbellek;
+  const kat = new Map();
+  (dmoTeslimat || []).forEach(r => {
+    const kodlar = dmoSatirKodListesi(r);
+    const fiyatlar = dmoListeParcala(dmoAlanDegeri(r, ['Tablo. Birim Fiyatı', 'Birim Fiyatı', 'BIRIM_FIYATI']));
+    if (!kodlar.length || kodlar.length !== fiyatlar.length) return;
+    kodlar.forEach((k, i) => {
+      const f = dmoFiyatCoz(fiyatlar[i]);
+      if (!k || !(f > 0)) return;
+      if (!kat.has(k)) kat.set(k, new Set());
+      kat.get(k).add(f);
+    });
+  });
+  dmoFiyatKatOnbellek = kat;
+  return kat;
+}
+/* Tekilleştirilmiş listeleri malzemelere dağıtır (sıra korunur).
+   DMO TekSayfa çıktısı aynı değerleri bir kez yazar; bu yüzden miktar
+   listesi kod listesinden kısa olabilir. Hangi malzemenin hangi değeri
+   aldığı, ihale listesindeki miktar/fiyat (barkod ile) ve DMO'nun kendi
+   fiyat kataloğuyla çözülür. Çözülemezse değer atanmaz (0 kalır) ki
+   yanlış miktar gösterilmesin. */
+function dmoMiktarHizala(kodlar, degerler, fiyatlar, ikn, barkodlar) {
+  const n = kodlar.length, m = degerler.length;
+  const bos = new Array(n).fill('');
+  const indeksler = new Array(n).fill(-1);
+  const kanit = new Array(n).fill(false);
+  if (!n || !m) return { degerler: bos, indeksler, kanit, guvenilir: false };
+  if (m === n) {
+    for (let i = 0; i < n; i++) { indeksler[i] = i; kanit[i] = true; }
+    return { degerler: degerler.slice(), indeksler, kanit, guvenilir: true };
+  }
+  if (m === 1) {
+    for (let i = 0; i < n; i++) { indeksler[i] = 0; kanit[i] = true; }
+    return { degerler: new Array(n).fill(degerler[0]), indeksler, kanit, guvenilir: true };
+  }
+  const ihale = dmoIhaleMalzemeHaritasi(ikn);
+  const fKat = dmoFiyatKatalogu();
+  const fiyatTam = fiyatlar.length === m;
+  const puan = (i, j) => {
+    let s = 0;
+    const kod = kodlar[i];
+    const bar = barkodlar && barkodlar[i] ? barkodlar[i] : '';
+    const ref = ihale.kod.get(kod) || (bar ? ihale.barkod.get(bar) : null);
+    const adet = dmoAdetCoz(degerler[j]);
+    if (ref) {
+      const partiEsit = (ref.miktarlar || []).some(v => v > 0 && Math.abs(v - adet) < 0.001);
+      if (partiEsit) s += 4;
+      else if (ref.toplam > 0 && Math.abs(ref.toplam - adet) < 0.001) s += 2;
+      else if ((ref.miktarlar || []).length) s -= 4;
+      if (fiyatTam && ref.fiyat > 0) {
+        const f = dmoFiyatCoz(fiyatlar[j]);
+        if (f > 0) s += (Math.abs(ref.fiyat - f) < 0.0001) ? 3 : -3;
+      }
+    } else if (fiyatTam) {
+      const f = dmoFiyatCoz(fiyatlar[j]);
+      const bilinen = fKat.get(kod);
+      if (f > 0 && bilinen) s += bilinen.has(f) ? 2 : -2;
+    }
+    return s;
+  };
+  const NEG = -1e9;
+  const dp = [], yol = [], say = [];
+  for (let i = 0; i <= n; i++) {
+    dp.push(new Array(m + 1).fill(NEG));
+    yol.push(new Array(m + 1).fill(null));
+    say.push(new Array(m + 1).fill(0));
+  }
+  dp[0][0] = 0; say[0][0] = 1;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j <= m; j++) {
+      const mevcut = dp[i][j];
+      if (mevcut === NEG) continue;
+      // kod i'ye değer atama (boş)
+      if (mevcut > dp[i + 1][j]) {
+        dp[i + 1][j] = mevcut; yol[i + 1][j] = [i, j, false]; say[i + 1][j] = say[i][j];
+      } else if (mevcut === dp[i + 1][j]) {
+        say[i + 1][j] = Math.min(2, say[i + 1][j] + say[i][j]);
+      }
+      // kod i'ye değer j ata
+      if (j < m) {
+        const yeni = mevcut + puan(i, j);
+        if (yeni > dp[i + 1][j + 1]) {
+          dp[i + 1][j + 1] = yeni; yol[i + 1][j + 1] = [i, j, true]; say[i + 1][j + 1] = say[i][j];
+        } else if (yeni === dp[i + 1][j + 1]) {
+          say[i + 1][j + 1] = Math.min(2, say[i + 1][j + 1] + say[i][j]);
+        }
+      }
+    }
+  }
+  if (dp[n][m] === NEG) return { degerler: bos, indeksler, kanit, guvenilir: false };
+  const skor = dp[n][m];
+  const tekCozum = say[n][m] === 1;
+  let i = n, j = m, atlanan = 0;
+  while (i > 0) {
+    const p = yol[i][j];
+    if (!p) break;
+    const [pi, pj, aldi] = p;
+    if (aldi) {
+      indeksler[pi] = pj;
+      bos[pi] = degerler[pj];
+      kanit[pi] = puan(pi, pj) > 0;
+    } else {
+      atlanan++;
+    }
+    i = pi; j = pj;
+  }
+  /* Satır düzeyi güven: atlama sayısı kod-değer farkına eşit olmalı.
+     Öğe düzeyi güven: ya kendi dayanağı eşleşmeli ya da tek olası çözüm olmalı. */
+  const satirGuven = atlanan === (n - m) && skor > 0;
+  for (let x = 0; x < n; x++) {
+    if (indeksler[x] < 0) { kanit[x] = false; continue; }
+    kanit[x] = tekCozum || (kanit[x] && satirGuven);
+  }
+  return { degerler: bos, indeksler, kanit, guvenilir: satirGuven };
+}
+/* DMO sipariş satırındaki malzemeler: kod, barkod, ad, sipariş, kalan, fiyat.
+   `guvenilir` false ise sipariş/kalan miktarları tekilleştirme nedeniyle
+   belirsizdir; hedef miktar için planlanan parti miktarı kullanılmalıdır. */
 function dmoMalzemeListesi(r) {
   if (!r) return [];
   const cache = dmoMalzemeCache.get(r);
-  if (cache) return cache;
-  const alanlar = r.alanlar || [];
-  const bul = adlar => {
-    for (const ad of adlar) {
-      const hedef = trLower(ad);
-      const f = alanlar.find(a => trLower(a.k) === hedef);
-      if (f && norm(f.v)) return norm(f.v);
-    }
-    return '';
-  };
-  const bol = v => String(v || '').split(/\s*\|\s*/);
+  if (cache && cache.surum === dmoVeriSurumu) return cache.liste;
+  const kodlar = dmoSatirKodListesi(r);
+  const barkodlar = dmoListeParcala(dmoAlanDegeri(r, ['Tablo. Barkod', 'Barkod', 'BARKOD']))
+    .map(barkodNormal);
+  const adlar = dmoListeParcala(dmoAlanDegeri(r, ['Tablo. Malzeme Adı', 'Malzeme Adı', 'MALZEME_ADI']));
+  const miktarlar = dmoListeParcala(dmoAlanDegeri(r, ['Tablo. Sipariş Miktarı', 'Sipariş Miktarı', 'SIPARIS_MIKTARI']));
+  const kalanlar = dmoListeParcala(dmoAlanDegeri(r, ['Tablo. Teslimat Kalan Miktarı', 'Teslimat Kalan Miktarı']));
+  const fiyatlar = dmoListeParcala(dmoAlanDegeri(r, ['Tablo. Birim Fiyatı', 'Birim Fiyatı', 'BIRIM_FIYATI']));
   let liste = [];
-  const kodStr = bul(['Tablo. Malzeme Kodu', 'Malzeme Kodu', 'MALZEME_KODU', 'Malzeme Kodu ']);
-  if (kodStr) {
-    const kodlar = bol(kodStr);
-    const miktarlar = bol(bul(['Tablo. Sipariş Miktarı', 'Sipariş Miktarı', 'SIPARIS_MIKTARI']));
-    const kalanlar = bol(bul(['Tablo. Teslimat Kalan Miktarı', 'Teslimat Kalan Miktarı']));
-    const adlar2 = bol(bul(['Tablo. Malzeme Adı', 'Malzeme Adı', 'MALZEME_ADI']));
-    liste = kodlar.map((k, i) => ({
-      kod: String(k == null ? '' : k).replace(/[^0-9]/g, ''),
-      ad: norm(adlar2[i] || ''),
-      siparis: dmoAdetCoz(miktar(miktarlar, i)),
-      kalan: dmoAdetCoz(miktar(kalanlar, i))
-    })).filter(x => x.kod);
+  if (kodlar.length) {
+    const hizali = dmoMiktarHizala(kodlar, miktarlar, fiyatlar, norm(r.ihaleNo), barkodlar);
+    const al = (dizi, i) => (dizi.length === 1 && kodlar.length > 1) ? dizi[0]
+      : (dizi.length > i ? dizi[i] : '');
+    /* Fiyat ve kalan, miktarla AYNI hizalamayı kullanır; aksi hâlde
+       tabloda miktar ile fiyat farklı malzemelere ait görünür. */
+    const fiyatAyni = fiyatlar.length === miktarlar.length && miktarlar.length > 1;
+    const kalanAyni = kalanlar.length === miktarlar.length && miktarlar.length > 1;
+    const eslesenDeger = (dizi, i, ayni) => {
+      if (dizi.length === 1 && kodlar.length > 1) return dizi[0];
+      if (ayni && hizali.indeksler[i] >= 0) return dizi[hizali.indeksler[i]];
+      if (!ayni && dizi.length === kodlar.length) return dizi[i];
+      return '';
+    };
+    liste = kodlar.map((k, i) => {
+      const guvenilir = !!hizali.kanit[i];
+      return {
+        kod: String(k == null ? '' : k).replace(/[^0-9]/g, ''),
+        barkod: barkodlar[i] || '',
+        ad: norm(adlar[i] || ''),
+        siparis: guvenilir ? dmoAdetCoz(hizali.degerler[i]) : 0,
+        siparisMetin: guvenilir ? norm(hizali.degerler[i]) : '',
+        kalan: guvenilir ? dmoAdetCoz(eslesenDeger(kalanlar, i, kalanAyni)) : 0,
+        fiyat: guvenilir ? dmoFiyatCoz(eslesenDeger(fiyatlar, i, fiyatAyni)) : 0,
+        guvenilir
+      };
+    }).filter(x => x.kod || x.barkod);
   }
-  function miktar(dizi, i) { return dizi.length > i ? dizi[i] : (dizi.length === 1 ? dizi[0] : ''); }
-  dmoMalzemeCache.set(r, liste);
+  dmoMalzemeCache.set(r, { surum: dmoVeriSurumu, liste });
   return liste;
 }
 /* Taşınır kodu karşılaştırması.
@@ -4412,11 +4659,36 @@ function dmoKodEsit(a, b) {
   const uzun = A.length <= B.length ? B : A;
   return kisa.length >= 6 && uzun.slice(-kisa.length) === kisa;
 }
-/* Bu sipariş satırında kaydın malzemesi var mı? Varsa miktar bilgisiyle döner. */
+/* Bu sipariş satırında kaydın malzemesi var mı? Varsa miktar bilgisiyle döner.
+   Sıra: taşınır kodu → barkod → malzeme adı. Taşınır kodu DMO'da boş
+   olabildiği için (aynı teslimatta farklı barkodlu ürünler) barkod kullanılır. */
 function dmoSatirMalzemesi(h, r) {
+  const liste = dmoMalzemeListesi(r);
+  if (!liste.length) return null;
   const kod = dmoKayitKodu(h);
-  if (!kod) return null;
-  return dmoMalzemeListesi(r).find(x => dmoKodEsit(kod, x.kod)) || null;
+  if (kod) {
+    const m = liste.find(x => x.kod && dmoKodEsit(kod, x.kod));
+    if (m) return m;
+  }
+  const barkod = barkodNormal(h && h.barkod);
+  if (barkod) {
+    const m = liste.find(x => x.barkod && x.barkod === barkod);
+    if (m) return m;
+  }
+  const adAnahtar = dmoAdAnahtari((h && (h.malzemeAdi || h.urun)) || (h && h.anaIdx >= 0 && anaListe[h.anaIdx] ? anaListe[h.anaIdx].malzeme : ''));
+  /* Ad eşleşmesi BİREBİR olmalı: "No:8" ile "No:8.5" gibi farklı ürünler
+     birbirine karışmamalı. (Kısmi eşleşme yanlış miktar gösteriyordu.) */
+  if (adAnahtar.length >= 8) {
+    const m = liste.find(x => dmoAdAnahtari(x.ad) === adAnahtar);
+    if (m) return m;
+  }
+  return null;
+}
+/* Malzeme adı karşılaştırma anahtarı: noktalama/ölçü farklarını yok sayar. */
+function dmoAdAnahtari(s) {
+  return trLower(s)
+    .replace(/\s*-\s*\d{8,14}.*$/, '')      // "ürün - barkod - marka" kuyruğu
+    .replace(/[^a-z0-9]/g, '');
 }
 /* DMO siparişinin detay satırlarında bu taşınır kodu geçiyor mu?
    (dmo_eklenti "Sipariş Detay" sekmesi yüklendiyse kesin eşleşme sağlar.) */
@@ -4425,9 +4697,9 @@ function dmoEkKodVar(r, kod) {
   return ((r && r.ek) || []).some(e =>
     (e.alanlar || []).some(a => dmoKodEsit(a.v, kod)));
 }
-/* Bir DMO satırında geçen malzeme kodları. Aynı sipariş birden çok malzeme
-   içerebildiği için, kaydın kodu bu kümenin içinde yoksa satır başka bir
-   malzemeye aittir. */
+/* Bir DMO satırında geçen malzeme kodları ve barkodları. Aynı sipariş birden
+   çok malzeme içerebildiği için, kaydın kodu/barkodu bu kümenin içinde yoksa
+   satır başka bir malzemeye aittir. */
 function dmoSatirKodlari(r) {
   const kodlar = new Set();
   const ekle = v => {
@@ -4436,10 +4708,13 @@ function dmoSatirKodlari(r) {
       if (kod.length >= 6) kodlar.add(kod);
     });
   };
-  dmoMalzemeListesi(r).forEach(m => { if (m && m.kod) ekle(m.kod); });
+  dmoMalzemeListesi(r).forEach(m => {
+    if (m && m.kod) ekle(m.kod);
+    if (m && m.barkod) ekle(m.barkod);
+  });
   ((r && r.ek) || []).forEach(e => {
     (e.alanlar || []).forEach(a => {
-      if (!/malzeme\s*kod|stok\s*kod|ta[sş][iı]n[iı]r/i.test(norm(a.k))) return;
+      if (!/malzeme\s*kod|stok\s*kod|ta[sş][iı]n[iı]r|barkod/i.test(norm(a.k))) return;
       ekle(a.v);
     });
   });
@@ -4460,6 +4735,9 @@ function dmoKayitKodu(h) {
 /* Her render başında çağrılır: İKN indeksi ve kayıt başına sonuç önbelleği
    sıfırlanır. 1300+ kayıt × 400 DMO satırı taraması aksi hâlde çok yavaş. */
 function dmoBulOnbellekSifirla() {
+  dmoVeriSurumu++;
+  dmoIhaleHaritaOnbellek = null;
+  dmoFiyatKatOnbellek = null;
   dmoBulOnbellek = new Map();
   dmoIknIndeks = { tam: new Map(), rakam: new Map() };
   dmoIknKayitIndeks = null;
@@ -4549,11 +4827,12 @@ function dmoKayitlariBulHam(h, kaynak) {
       (!h.teslimatNo || !r.teslimatNo || norm(h.teslimatNo) === norm(r.teslimatNo)));
     if (bagli.length) return { satirlar: bagli, tur: 'bagli' };
   }
-  // 2) Bu siparişin malzeme listesinde kaydın taşınır kodu varsa (kesin)
+  // 2) Bu siparişin malzeme listesinde kaydın taşınır kodu veya barkodu varsa (kesin)
   const kod = dmoKayitKodu(h);
-  if (kod) {
-    const kodlu = adaylar.filter(r => dmoSatirMalzemesi(h, r) || dmoEkKodVar(r, kod));
-    if (kodlu.length) return { satirlar: kodlu, tur: 'kod' };
+  const barkod = barkodNormal(h.barkod);
+  if (kod || barkod) {
+    const kodlu = adaylar.filter(r => dmoSatirMalzemesi(h, r) || (kod && dmoEkKodVar(r, kod)));
+    if (kodlu.length) return { satirlar: kodlu, tur: kod ? 'kod' : 'barkod' };
   }
   const firma = dmoFirmaAnahtar(h.firma);
   if (firma.length >= 4) {
@@ -4573,11 +4852,13 @@ function dmoKayitlariBulHam(h, kaynak) {
      satırlar döndürülür; şüpheli durumda boş liste + adaylar verilir. */
   const kodlar = new Set();
   adaylar.forEach(r => dmoSatirKodlari(r).forEach(k => kodlar.add(k)));
-  if (kod && kodlar.size && ![...kodlar].some(k => dmoKodEsit(kod, k))) {
+  const kodEslesiyor = (kod && [...kodlar].some(k => dmoKodEsit(kod, k))) ||
+    (barkod && kodlar.has(barkod));
+  if (!kodEslesiyor && (kod || barkod) && kodlar.size) {
     return { satirlar: [], tur: 'baskaMalzeme', adaylar };
   }
-  if (kodlar.size > 1) return { satirlar: [], tur: 'belirsiz', adaylar };
-  if (dmoAyniIknKayitlari(h.ikn).length > 1) {
+  if (kodlar.size > 1 && !(barkod && kodlar.has(barkod))) return { satirlar: [], tur: 'belirsiz', adaylar };
+  if (dmoAyniIknKayitlari(h.ikn).length > 1 && !(barkod && kodlar.has(barkod))) {
     return { satirlar: [], tur: 'belirsiz', adaylar };
   }
   return { satirlar: adaylar, tur: 'ihale' };
@@ -4909,9 +5190,15 @@ function dmoSatirHedef(h, r, harita) {
   const p = dmoSatirPartisi(h, r, harita);
   if (p && Number(p.siparisMiktar) > 0) return Number(p.siparisMiktar);
   // DMO'daki malzeme bazlı sipariş miktarı en doğru kaynaktır.
+  // (Tekilleştirme nedeniyle miktar belirsizse 0 döner.)
   const dm = dmoSatirMalzemesi(h, r);
   if (dm && dm.siparis > 0) return dm.siparis;
   if (p && Number(p.miktar) > 0) return Number(p.miktar);
+  /* Malzeme miktarı DMO çıktısında belirsizse (aynı siparişte birden çok
+     malzeme + tekilleştirilmiş miktarlar) kullanıcının planladığı parti
+     miktarı tek doğru kaynaktır. */
+  const planliPartiler = ((h && h.partiler) || []).filter(x => (Number(x.miktar) || 0) > 0);
+  if (planliPartiler.length === 1) return Number(planliPartiler[0].miktar);
   const ekMiktar = dmoEkMiktari(h, r);
   if (ekMiktar > 0) return ekMiktar;
   // Planlanmış partisi olan kayıtta sipariş miktarı partiden gelir; bu satır
@@ -5140,6 +5427,46 @@ function dmoTeslimAlSil(k, partiIdx) {
     `Gelen: ${p.gelen || 0}, Tarih: ${p.gelisTarihi || '—'}`);
   kaydet(); teslimatRender(); raporRender(); dmoYenile();
 }
+/* Bir sipariş satırındaki malzemeler (kod + barkod + miktar).
+   Aynı siparişte birden çok malzeme olabildiği ve DMO TekSayfa çıktısı aynı
+   değerleri tekilleştirdiği için, miktarın hangi malzemeye ait olduğu
+   barkod / ihale listesi karşılaştırmasıyla çözülür. Belirsizse miktar
+   "—" gösterilir ve hedef olarak planlanan parti miktarı kullanılır. */
+function dmoMalzemeTablosuHtml(h, r) {
+  const liste = dmoMalzemeListesi(r);
+  if (!liste.length) {
+    return '<div style="padding:8px 10px;font-size:11.5px;color:#64748b;">Bu siparişte malzeme detayı yok.</div>';
+  }
+  const kod = dmoKayitKodu(h);
+  const barkod = barkodNormal(h && h.barkod);
+  const secili = dmoSatirMalzemesi(h, r);
+  let html = `<div style="padding:8px 10px 4px;font-size:10.5px;color:#64748b;">
+    Siparişteki malzemeler. Bu kaydın malzemesi <b style="color:#166534;">yeşil</b> gösterilir.
+    Miktar <b>—</b> ise DMO çıktısı aynı miktarları tekilleştirdiği için o malzemenin miktarı
+    okunamamıştır; hedef olarak planlanan parti miktarı kullanılır.
+  </div><div style="overflow-x:auto;"><table class="dmo-table" style="margin:0 0 6px;">
+    <tr><th>#</th><th>Malzeme Kodu</th><th>Barkod</th><th>Malzeme Adı</th><th>Sipariş Miktarı</th><th>Birim Fiyat</th></tr>`;
+  liste.forEach((m, i) => {
+    const buMu = secili && ((m.kod && m.kod === secili.kod) || (m.barkod && m.barkod === secili.barkod));
+    html += `<tr${buMu ? ' style="background:#dcfce7;font-weight:600;"' : ''}>
+      <td>${i + 1}</td>
+      <td style="font-family:monospace;font-size:10.5px;">${esc(m.kod) || '-'}</td>
+      <td style="font-family:monospace;font-size:10.5px;">${esc(m.barkod) || '-'}</td>
+      <td>${esc(m.ad) || '-'}</td>
+      <td style="text-align:right;">${m.guvenilir && m.siparis > 0 ? m.siparis.toLocaleString('tr-TR') : '<span style="color:#94a3b8;" title="Tekilleştirme nedeniyle okunamadı">—</span>'}</td>
+      <td style="text-align:right;">${m.fiyat > 0 ? Number(m.fiyat).toLocaleString('tr-TR',{minimumFractionDigits:4,maximumFractionDigits:4}) : '-'}</td>
+    </tr>`;
+  });
+  html += `</table></div>`;
+  return html;
+}
+function dmoMalzemeleriAcKapa(k) {
+  const ref = dmoRef[k];
+  if (!ref) return;
+  const el = document.getElementById('dmoMal_' + dmoGuvenliId(ref.id));
+  if (!el) return;
+  el.style.display = el.style.display === 'none' ? 'table-row' : 'none';
+}
 /* DMO sipariş ↔ teslimat tablosu (kayıt görünümü ve malzeme görünümü
    aynı tabloyu kullanır). Her satırda teslim alma formu açılabilir. */
 function dmoSiparisTablosuHtml(ihaleIdx, h, bulunan) {
@@ -5192,11 +5519,15 @@ function dmoSiparisTablosuHtml(ihaleIdx, h, bulunan) {
         <button class="dmo-btn al" onclick="dmoTeslimAlAcKapa(${k})" title="Bu siparişin gelen miktarını ve tarihini gir">📥 Teslim Al</button>
         <button class="dmo-btn${bagliMi ? ' bagli' : ''}" onclick="dmoSiparisBagla(${ihaleIdx}, '${String(r._id).replace(/'/g, "\\'")}')"
           title="Bu siparişi kayda bağla / bağı kaldır">${bagliMi ? '✓ Bağlı' : '🔗 Bağla'}</button>
+        <button class="dmo-btn" onclick="dmoMalzemeleriAcKapa(${k})" title="Bu siparişteki malzemeleri barkoduyla göster">🧾 Malzemeler</button>
         <button class="dmo-btn" onclick="dmoAlanlariAcKapa(${k})" title="Tüm DMO alanlarını göster">⋯ Tümü</button>
       </td>
     </tr>
     <tr id="dmoAl_${guvenliId}" style="display:none;">
       <td colspan="14" style="padding:0;">${dmoTeslimAlHtml(k, h, r)}</td>
+    </tr>
+    <tr id="dmoMal_${guvenliId}" style="display:none;">
+      <td colspan="14" style="background:#f8fafc;padding:0;">${dmoMalzemeTablosuHtml(h, r)}</td>
     </tr>
     <tr id="dmoAlan_${guvenliId}" style="display:none;">
       <td colspan="14" style="background:#f8fafc;padding:0;">
@@ -5254,6 +5585,7 @@ function dmoDetayHtml(ihaleIdx, h, a) {
   let html = `
     <table class="dmo-table" style="margin-bottom:12px;">
       <tr><th style="width:32%;">Taşınır Kodu</th><td>${esc(a.tasinir) || '-'}</td></tr>
+      <tr><th>Barkod</th><td style="font-family:monospace;">${esc(h.barkod) || '-'}</td></tr>
       <tr><th>Firma</th><td>${esc(h.firma) || '-'}</td></tr>
       <tr><th>İKN (İhale No)</th><td>${esc(h.ikn) || '-'}</td></tr>
       <tr><th>Termin (DMO'dan otomatik)</th><td style="color:#b91c1c;font-weight:700;">${tarihYaz(termin) || 'Belirtilmemiş'} ${terminHucresi(h)}</td></tr>
