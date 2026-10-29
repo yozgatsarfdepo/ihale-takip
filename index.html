@@ -369,7 +369,7 @@
 </div>
 
 <header>
-  <h1>🏥 İhale Takip Programı <span style="font-size:11px;opacity:.7;font-weight:400;" id="surumEtiket" title="Yüklü sürüm — güncel değilse Ctrl+F5 ile yenileyin">v5.9</span></h1>
+  <h1>🏥 İhale Takip Programı <span style="font-size:11px;opacity:.7;font-weight:400;" id="surumEtiket" title="Yüklü sürüm — güncel değilse Ctrl+F5 ile yenileyin">v6.0</span></h1>
   <div class="hdr-right">
     <span id="kullaniciEtiket" style="font-size:11px;opacity:.85;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="Giriş yapan kullanıcı"></span>
     <span style="font-size:11px;opacity:.7;cursor:pointer;" id="kayitZaman" onclick="kaydetHemen()" title="Tıklayarak hemen kaydet"></span>
@@ -4618,6 +4618,54 @@ function dmoDegerleriHizala(kodlar, barkodlar, degerler, ikn, tip) {
   }
   return { degerler: sonuc, indeksler, guvenler };
 }
+/* Yeni dmo_eklenti (4.4+) çıktısında her malzeme AYRI sütunlarda gelir:
+     Tablo. Malzeme 1 Kodu | Tablo. Malzeme 1 Barkod | ... | Malzeme 2 Kodu
+   Bu sütunlar varsa eşleştirme/tahmine gerek kalmaz: kod, barkod, ad,
+   miktar ve fiyat aynı malzeme satırından okunur. Eski dosyalarda bu
+   sütunlar yoktur; o durumda aşağıdaki hizalama mantığı devreye girer. */
+function dmoMalzemeSutunlari(r) {
+  const alanlar = (r && r.alanlar) || [];
+  if (!alanlar.length) return [];
+  const harita = [];
+  alanlar.forEach(a => {
+    if (a && a.k) harita.push({ k: trLower(a.k), v: norm(a.v) });
+  });
+  if (!harita.length) return [];
+  let enFazla = 0;
+  harita.forEach(x => {
+    const m = x.k.match(/malzeme\s+(\d+)\s+(?:kodu|barkod|adi|miktari|fiyati)/);
+    if (m) enFazla = Math.max(enFazla, Number(m[1]));
+  });
+  if (!enFazla) return [];
+  const al = (n, alan) => {
+    const sonek = 'malzeme ' + n + ' ' + alan;
+    for (let i = 0; i < harita.length; i++) {
+      const k = harita[i].k;
+      if (k.length >= sonek.length && k.slice(-sonek.length) === sonek) return harita[i].v;
+    }
+    return '';
+  };
+  const liste = [];
+  for (let n = 1; n <= enFazla; n++) {
+    const kod = String(al(n, 'kodu')).replace(/[^0-9]/g, '');
+    const barkod = barkodNormal(al(n, 'barkod'));
+    const ad = al(n, 'adi');
+    const miktar = al(n, 'miktari');
+    const fiyat = al(n, 'fiyati');
+    if (!kod && !barkod && !ad) continue;
+    liste.push({
+      kod, barkod,
+      ad,
+      adAnahtar: dmoAdAnahtari(ad),
+      siparis: dmoAdetCoz(miktar),
+      siparisMetin: miktar,
+      kalan: 0,
+      fiyat: dmoFiyatCoz(fiyat),
+      guvenilir: !!miktar
+    });
+  }
+  return liste;
+}
 /* DMO sipariş satırındaki malzemeler: kod, barkod, ad, sipariş, kalan, fiyat.
    `guvenilir` false ise sipariş/kalan değeri tekilleştirme nedeniyle
    tahminidir; hedef miktar için planlanan parti miktarı kullanılır. */
@@ -4625,6 +4673,12 @@ function dmoMalzemeListesi(r) {
   if (!r) return [];
   const cache = dmoMalzemeCache.get(r);
   if (cache && cache.surum === dmoVeriSurumu) return cache.liste;
+  /* Önce malzeme bazlı sütunlar (kesin eşleşme). */
+  const sutunlu = dmoMalzemeSutunlari(r);
+  if (sutunlu.length) {
+    dmoMalzemeCache.set(r, { surum: dmoVeriSurumu, liste: sutunlu });
+    return sutunlu;
+  }
   const kodlar = dmoSatirKodListesi(r);
   const barkodlar = dmoListeParcala(dmoAlanDegeri(r, ['Tablo. Barkod', 'Barkod', 'BARKOD']))
     .map(barkodNormal);
@@ -5294,9 +5348,25 @@ function dmoSiparissizPartiler(h, harita) {
     p && (Number(p.miktar) || 0) > 0 && !bagli.has(p));
 }
 /* Tüm DMO alanlarını 4 sütunlu (etiket/değer × 2) tablo olarak yazar.
-   Eski hâli tek sütunda aşağı doğru uzayıp tabloyu bozuyordu. */
+   Eski hâli tek sütunda aşağı doğru uzayıp tabloyu bozuyordu.
+   Yeni çıktıda malzemeler ayrı sütunlarda geldiği için, " | " ile
+   birleştirilmiş eski malzeme sütunları burada GİZLENİR; aksi hâlde
+   aynı bilgi iki kez ve karışık görünür. */
 function dmoAlanTablosuHtml(alanlar) {
-  const liste = (alanlar || []).filter(a => a && norm(a.v));
+  let liste = (alanlar || []).filter(a => a && norm(a.v));
+  if (!liste.length) return '';
+  const malzemeBazli = liste.some(a =>
+    /malzeme\s+\d+\s+(kodu|barkod|adi|miktari|fiyati)/.test(trLower(a.k)));
+  if (malzemeBazli) {
+    const birlesik = [
+      'malzeme kodu', 'barkod', 'malzeme adi', 'siparis miktari', 'birim fiyati',
+      'teslimat kalan miktari', 'sozlesme miktari', 'ism onay miktari'
+    ];
+    liste = liste.filter(a => {
+      const k = trLower(a.k).replace(/^tablo\.\s*/, '');
+      return birlesik.indexOf(k) === -1;
+    });
+  }
   if (!liste.length) return '';
   let html = '<table class="dmo-alan-tablo"><tbody>';
   for (let i = 0; i < liste.length; i += 2) {
@@ -5499,14 +5569,24 @@ function dmoMalzemeTablosuHtml(h, r) {
   if (!liste.length) {
     return '<div style="padding:8px 10px;font-size:11.5px;color:#64748b;">Bu siparişte malzeme detayı yok.</div>';
   }
-   const kod = dmoKayitKodu(h);
+  const kod = dmoKayitKodu(h);
   const barkod = barkodNormal(h && h.barkod);
   const secili = dmoSatirMalzemesi(h, r);
+  const malzemeBazli = dmoMalzemeSutunlari(r).length > 0;
+  const eksikMiktar = liste.filter(m => m.siparis <= 0).length;
+  let uyari = '';
+  if (!malzemeBazli && eksikMiktar) {
+    uyari = `<div style="margin:0 0 6px;padding:7px 10px;background:#fef3c7;border:1px solid #fcd34d;border-radius:5px;font-size:10.5px;color:#92400e;">
+      ⚠️ Bu DMO dosyası eski sürümle indirildiği için aynı siparişteki tekrar eden miktarlar hücrede tekilleştirilmiş;
+      ${eksikMiktar} malzemenin miktarı okunamadı. DMO eklentisini <b>v4.4</b>'e güncelleyip dosyayı yeniden indirin —
+      yeni çıktıda her malzeme kendi sütununda (Malzeme 1 Kodu / Barkod / Miktarı ...) gelir.
+    </div>`;
+  }
   let html = `<div style="padding:8px 10px 4px;font-size:10.5px;color:#64748b;">
     Siparişteki malzemeler. Bu kaydın malzemesi <b style="color:#166534;">yeşil</b> gösterilir.
     Miktar <b>~</b> ile yazılmışsa DMO çıktısı aynı miktarları tekilleştirdiği için sıraya göre
     eşlenmiştir; <b>—</b> ise miktar belirlenememiştir.
-  </div><div style="overflow-x:auto;"><table class="dmo-table" style="margin:0 0 6px;">
+  </div>${uyari}<div style="overflow-x:auto;"><table class="dmo-table" style="margin:0 0 6px;">
     <tr><th>#</th><th>Malzeme Kodu</th><th>Barkod</th><th>Malzeme Adı</th><th>Sipariş Miktarı</th><th>Birim Fiyat</th></tr>`;
   liste.forEach((m, i) => {
     const buMu = secili && ((m.kod && m.kod === secili.kod) || (m.barkod && m.barkod === secili.barkod));
