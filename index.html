@@ -2,7 +2,7 @@
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
-<title>İhale Takip Programı v5</title>
+<title>İhale Takip Programı v6.1</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <!-- FIREBASE BAŞLANGIÇ -->
 <script type="module">
@@ -100,6 +100,12 @@
     align-items: center;
   }
   .table-wrap { max-height: 62vh; overflow: auto; border: 1px solid #e2e8f0; border-radius: 6px; }
+  /* Sayfalama: 10.000+ satırda tarayıcının kilitlenmesini önler. */
+  .sayfalama { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; font-size:11.5px; color:#475569; }
+  .sayfalama button { background:#fff; border:1px solid #cbd5e1; border-radius:5px; padding:3px 9px; cursor:pointer; font-size:11.5px; color:#1e3a5f; }
+  .sayfalama button:disabled { opacity:.45; cursor:default; }
+  .sayfalama .sf-bilgi { font-weight:600; color:#1e3a5f; }
+  .sayfalama select { border:1px solid #cbd5e1; border-radius:5px; padding:2px 4px; font-size:11.5px; }
   /* Ana liste: Malzeme Tanımı geniş kalır, SUT kodu dar sütunda alt satıra sarar */
   .ana-tablo { table-layout: fixed; min-width: 1020px; }
   .ana-tablo th:nth-child(1), .ana-tablo td:nth-child(1) { width: 44px; }
@@ -369,7 +375,7 @@
 </div>
 
 <header>
-  <h1>🏥 İhale Takip Programı <span style="font-size:11px;opacity:.7;font-weight:400;" id="surumEtiket" title="Yüklü sürüm — güncel değilse Ctrl+F5 ile yenileyin">v6.0</span></h1>
+  <h1>🏥 İhale Takip Programı <span style="font-size:11px;opacity:.7;font-weight:400;" id="surumEtiket" title="Yüklü sürüm — güncel değilse Ctrl+F5 ile yenileyin">v6.1</span></h1>
   <div class="hdr-right">
     <span id="kullaniciEtiket" style="font-size:11px;opacity:.85;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="Giriş yapan kullanıcı"></span>
     <span style="font-size:11px;opacity:.7;cursor:pointer;" id="kayitZaman" onclick="kaydetHemen()" title="Tıklayarak hemen kaydet"></span>
@@ -441,6 +447,7 @@
           <tbody id="anaTbody"></tbody>
         </table>
       </div>
+      <div class="sayfalama" id="anaSayfalama"></div>
     </div>
   </div>
 
@@ -580,6 +587,7 @@
             <tbody id="ihaleTbody"></tbody>
           </table>
         </div>
+        <div class="sayfalama" id="ihaleSayfalama"></div>
         <div class="legend">
           <span style="background:#dcfce7;">İhale Sona Erdi</span>
           <span style="background:#fee2e2;">İhale İptal</span>
@@ -623,6 +631,7 @@
           <tbody id="teslimatTbody"></tbody>
         </table>
       </div>
+      <div class="sayfalama" id="teslimatSayfalama"></div>
     </div>
   </div>
 
@@ -672,6 +681,7 @@
           <tbody id="hafizaTbody"></tbody>
         </table>
       </div>
+      <div class="sayfalama" id="hafizaSayfalama"></div>
     </div>
   </div>
 
@@ -2356,6 +2366,8 @@ function idHafizaTemizle() {
    HAFIZA RENDER
 ============================================================ */
 function hafizaRender() {
+  if (!sekmeAktifMi('stok')) { kirliSekmeler.add('hafiza'); return; }
+  kirliSekmeler.delete('hafiza');
   const q = norm(document.getElementById('hafizaArama').value).toLowerCase();
   const tbody = document.getElementById('hafizaTbody');
   tbody.innerHTML = '';
@@ -2388,13 +2400,21 @@ function hafizaRender() {
     }
     return '';
   };
-  siraUygula(entries, siralamaDurumu.hafiza, hafizaSiraDeger).forEach(([tas, v]) => {
+  const filtreli = [];
+  siraUygula(entries, siralamaDurumu.hafiza, hafizaSiraDeger).forEach(e => {
+    const [tas, v] = e;
     const anaMal = anaHarita[tas];
     const hay = [tas, v.id, anaMal && anaMal.malzeme].join(' ').toLowerCase();
     if (q && !hay.includes(q)) return;
+    filtreli.push(e);
+  });
+  filtreDegisti('hafiza', q + '|' + JSON.stringify(siralamaDurumu.hafiza || null));
+  const dilim = sayfaDilimi('hafiza', filtreli.length);
+  filtreli.slice(dilim.bas, dilim.bit).forEach(([tas, v], sayfaSira) => {
+    const anaMal = anaHarita[tas];
     goster++;
     satirHtml.push(`<tr>
-      <td>${goster}</td>
+      <td>${dilim.bas + sayfaSira + 1}</td>
       <td style="font-family:monospace;font-size:11px;">${esc(tas)}</td>
       <td><b>${esc(v.id)}</b></td>
       <td><span class="badge ${v.kaynak==='stok'?'info':'ok'}">${esc(v.kaynak)}</span></td>
@@ -2473,9 +2493,81 @@ function idDuzenle(idx, ev) {
 }
 
 /* ============================================================
+   SAYFALAMA + SEKME BAZLI ÇİZİM
+   10.000+ satırda tüm tabloyu DOM'a basmak tarayıcıyı kilitler.
+   Her tablo yalnızca aktif sayfasını basar; görünmeyen sekmeler
+   "kirli" işaretlenir ve sekme açıldığında çizilir.
+============================================================ */
+const SAYFA_SECENEKLERI = [100, 200, 500, 1000, 0];
+let sayfaBoyutu = 200;
+const sayfaDurumu = { ana: 1, ihale: 1, teslimat: 1, hafiza: 1 };
+const kirliSekmeler = new Set();
+const sonFiltreImza = {};
+const SAYFA_RENDER = {
+  ana: () => anaRender(),
+  ihale: () => ihaleRender(),
+  teslimat: () => teslimatRender(),
+  hafiza: () => hafizaRender()
+};
+/* Sekme kimliği → o sekmenin tablo anahtarı */
+const SEKME_TABLO = { ana: 'ana', ihale: 'ihale', teslimat: 'teslimat', stok: 'hafiza' };
+function sekmeAktifMi(ad) {
+  const el = document.getElementById('tab-' + ad);
+  return !!(el && el.classList.contains('active'));
+}
+/* Filtre/sıralama değiştiyse ilk sayfaya dön. */
+function filtreDegisti(ad, imza) {
+  if (sonFiltreImza[ad] !== imza) { sonFiltreImza[ad] = imza; sayfaDurumu[ad] = 1; }
+}
+function sayfaDilimi(ad, toplam) {
+  const boyut = sayfaBoyutu > 0 ? sayfaBoyutu : (toplam || 1);
+  const sayfaSayisi = Math.max(1, Math.ceil((toplam || 0) / boyut));
+  let sayfa = sayfaDurumu[ad] || 1;
+  if (sayfa > sayfaSayisi) sayfa = sayfaSayisi;
+  if (sayfa < 1) sayfa = 1;
+  sayfaDurumu[ad] = sayfa;
+  const bas = (sayfa - 1) * boyut;
+  return { bas, bit: Math.min(bas + boyut, toplam || 0), sayfa, sayfaSayisi };
+}
+function sayfaGit(ad, sayfa) {
+  sayfaDurumu[ad] = Number(sayfa) || 1;
+  const f = SAYFA_RENDER[ad];
+  if (f) f();
+  /* Uzun listede sayfa değişince tablonun başına dön. */
+  const kap = document.getElementById(ad + 'Sayfalama');
+  const wrap = kap && kap.previousElementSibling;
+  if (wrap && wrap.classList.contains('table-wrap')) wrap.scrollTop = 0;
+}
+function sayfaBoyutuDegistir(deger) {
+  sayfaBoyutu = Number(deger) || 0;
+  Object.keys(sayfaDurumu).forEach(k => { sayfaDurumu[k] = 1; });
+  Object.keys(SAYFA_RENDER).forEach(ad => { if (sekmeAktifMi(ad)) SAYFA_RENDER[ad](); });
+}
+function sayfalamaCiz(id, ad, toplam) {
+  const kap = document.getElementById(id);
+  if (!kap) return;
+  if (!toplam) { kap.innerHTML = ''; return; }
+  const d = sayfaDilimi(ad, toplam);
+  const ilk = d.bas + 1, son = d.bit;
+  const secenek = SAYFA_SECENEKLERI.map(n =>
+    '<option value="' + n + '"' + (n === sayfaBoyutu ? ' selected' : '') + '>' + (n ? n : 'Tümü') + '</option>').join('');
+  kap.innerHTML =
+    '<button ' + (d.sayfa <= 1 ? 'disabled' : '') + ' onclick="sayfaGit(\'' + ad + '\',1)">« İlk</button>' +
+    '<button ' + (d.sayfa <= 1 ? 'disabled' : '') + ' onclick="sayfaGit(\'' + ad + '\',' + (d.sayfa - 1) + ')">‹ Önceki</button>' +
+    '<span class="sf-bilgi">' + ilk.toLocaleString('tr-TR') + '–' + son.toLocaleString('tr-TR') +
+      ' / ' + toplam.toLocaleString('tr-TR') + '</span>' +
+    '<span>Sayfa ' + d.sayfa + ' / ' + d.sayfaSayisi + '</span>' +
+    '<button ' + (d.sayfa >= d.sayfaSayisi ? 'disabled' : '') + ' onclick="sayfaGit(\'' + ad + '\',' + (d.sayfa + 1) + ')">Sonraki ›</button>' +
+    '<button ' + (d.sayfa >= d.sayfaSayisi ? 'disabled' : '') + ' onclick="sayfaGit(\'' + ad + '\',' + d.sayfaSayisi + ')">Son »</button>' +
+    '<span style="margin-left:auto;">Sayfa boyutu <select onchange="sayfaBoyutuDegistir(this.value)">' + secenek + '</select></span>';
+}
+
+/* ============================================================
    ANA LİSTE RENDER
 ============================================================ */
 function anaRender() {
+  if (!sekmeAktifMi('ana')) { kirliSekmeler.add('ana'); return; }
+  kirliSekmeler.delete('ana');
   if (typeof dmoBulOnbellekSifirla === 'function') dmoBulOnbellekSifirla();
   const q = norm(document.getElementById('anaArama').value).toLowerCase();
   const f = document.getElementById('anaFiltre').value;
@@ -2500,8 +2592,11 @@ function anaRender() {
     return k.a[alan];
   };
   const sirali = siraUygula(kayitlar, siralamaDurumu.ana, anaSiraDeger);
+  filtreDegisti('ana', q + '|' + f + '|' + JSON.stringify(siralamaDurumu.ana || null));
+  const dilim = sayfaDilimi('ana', sirali.length);
+  const gorunen = sirali.slice(dilim.bas, dilim.bit);
   const satirHtml = [];
-  sirali.forEach(({ a, i }, sira) => {
+  gorunen.forEach(({ a, i }, sira) => {
     const ihalesi = ihaleHaritasi.get(i) || [];
     const ihaleDurum = ihalesi.length === 0 ? '<span class="badge wait">Yok</span>' :
       ihalesi.some(x => /sona erdi/i.test(x.alimDurum)) ? '<span class="badge ok">Var</span>' :
@@ -2511,7 +2606,7 @@ function anaRender() {
       ? ihalesi.reduce((s, h) => s + (dmoKayitlariBul(h).satirlar || []).length, 0)
       : 0;
     satirHtml.push(`<tr>
-      <td>${sira + 1}</td>
+      <td>${dilim.bas + sira + 1}</td>
       <td><span class="editable-id" onclick="idDuzenle(${i}, event)" title="Tıklayarak düzenle">${esc(a.id) || '—'}</span></td>
       <td>${esc(a.malzeme)}</td>
       <td class="sut-hucre">${esc(a.sut)}</td>
@@ -2526,7 +2621,13 @@ function anaRender() {
   tbody.innerHTML = sirali.length
     ? satirHtml.join('')
     : `<tr><td colspan="10"><div class="empty-state"><h3>Kayıt yok</h3></div></td></tr>`;
-  document.getElementById('anaAdetBadge').textContent = anaListe.length + ' malzeme';
+  const anaBadge = document.getElementById('anaAdetBadge');
+  if (anaBadge) {
+    anaBadge.textContent = (sirali.length === anaListe.length)
+      ? anaListe.length.toLocaleString('tr-TR') + ' malzeme'
+      : sirali.length.toLocaleString('tr-TR') + ' / ' + anaListe.length.toLocaleString('tr-TR') + ' malzeme';
+  }
+  sayfalamaCiz('anaSayfalama', 'ana', sirali.length);
   siraIsaretle('ana');
 }
 function anaSil(i) {
@@ -2647,6 +2748,8 @@ function filtreSecenekleriGuncelle() {
    İHALE RENDER
 ============================================================ */
 function ihaleRender() {
+  if (!sekmeAktifMi('ihale')) { kirliSekmeler.add('ihale'); return; }
+  kirliSekmeler.delete('ihale');
   if (typeof dmoBulOnbellekSifirla === 'function') dmoBulOnbellekSifirla();
   const q = norm(document.getElementById('ihaleArama').value).toLowerCase();
   const fYil = document.getElementById('filterYil').value;
@@ -2688,7 +2791,9 @@ function ihaleRender() {
     if (alan === 'tarih') { const t = tarihDeger(s.ihale && s.ihale.tarih); return t ? t.getTime() : ''; }
     return s.ihale ? s.ihale[alan] : '';
   };
-  siraUygula(satirlar, siralamaDurumu.ihale, ihaleSiraDeger).forEach((s, sira) => {
+  /* 1. geçiş: filtre (sıralı tam liste üzerinde, DOM'a dokunmadan). */
+  const filtreli = [];
+  siraUygula(satirlar, siralamaDurumu.ihale, ihaleSiraDeger).forEach(s => {
     const a = s.ana;
     const h = s.ihale;
     const hay = [a.malzeme, a.tasinir, a.id, h && h.ikn, h && h.firma].join(' ').toLowerCase();
@@ -2704,7 +2809,16 @@ function ihaleRender() {
       // Tam eşleşme (büyük/küçük harf ve Türkçe karakter duyarsız)
       if (trLower(h.alimDurum || '') !== trLower(fDurum)) return;
     }
+    filtreli.push(s);
+  });
+  filtreDegisti('ihale', [q, fYil, fDonem, fAy, fGrup, fDurum].join('|') + '|' + JSON.stringify(siralamaDurumu.ihale || null));
+  /* 2. geçiş: yalnız aktif sayfa DOM'a basılır. */
+  const dilim = sayfaDilimi('ihale', filtreli.length);
+  filtreli.slice(dilim.bas, dilim.bit).forEach((s, sira) => {
+    const a = s.ana;
+    const h = s.ihale;
     goster++;
+    const siraNo = dilim.bas + sira + 1;
     const durum = !h ? '<span class="badge wait">Henüz İhale Yok</span>' :
       /sona erdi/i.test(h.alimDurum) ? '<span class="badge ok">' + esc(h.alimDurum) + '</span>' :
       /iptal/i.test(h.alimDurum) ? '<span class="badge no">' + esc(h.alimDurum) + '</span>' :
@@ -2715,7 +2829,7 @@ function ihaleRender() {
     else if (/sona erdi/i.test(h.alimDurum)) sinif = 'ihale-var';
     else if (/iptal/i.test(h.alimDurum)) sinif = 'ihale-iptal';
     satirHtml.push(`${sinif ? `<tr class="${sinif}">` : '<tr>'}
-      <td>${goster}</td>
+      <td>${siraNo}</td>
       <td>${esc(a.id) || '<span style="color:#dc2626;">YOK</span>'}</td>
       <td>${esc(a.malzeme)}${s.baglantisiz ? ' <span class="badge no" title="Taşınır kodu Ana Liste\'de yok. Ana listeye eklenirse otomatik bağlanır.">bağlantısız</span>' : ''}</td>
       <td style="font-family:monospace;font-size:11px;">${esc(a.tasinir)}</td>
@@ -2734,10 +2848,13 @@ function ihaleRender() {
       <td>${durum}</td>
     </tr>`);
   });
-  tbody.innerHTML = goster === 0
+  tbody.innerHTML = filtreli.length === 0
     ? `<tr><td colspan="17"><div class="empty-state"><h3>Kayıt yok</h3></div></td></tr>`
     : satirHtml.join('');
-  document.getElementById('ihaleAdetBadge').textContent = ihaleListe.length + ' ihale satırı';
+  document.getElementById('ihaleAdetBadge').textContent = filtreli.length === ihaleListe.length
+    ? ihaleListe.length.toLocaleString('tr-TR') + ' ihale satırı'
+    : filtreli.length.toLocaleString('tr-TR') + ' / ' + ihaleListe.length.toLocaleString('tr-TR') + ' ihale satırı';
+  sayfalamaCiz('ihaleSayfalama', 'ihale', filtreli.length);
   const baglantisiz = baglantisizIhaleSayisi();
   if (baglantisiz > 0) {
     const b = document.getElementById('ihaleAdetBadge');
@@ -2774,6 +2891,13 @@ function filtreleriTemizle() {
    TESLİMAT RENDER
 ============================================================ */
 function teslimatRender() {
+  if (!sekmeAktifMi('teslimat')) {
+    kirliSekmeler.add('teslimat');
+    /* DMO İş Listesi sekmesi görünürse o ekran yine tazelensin. */
+    if (sekmeAktifMi('dmois') && typeof dmoIsListesiRender === 'function') dmoIsListesiRender();
+    return;
+  }
+  kirliSekmeler.delete('teslimat');
   if (typeof dmoBulOnbellekSifirla === 'function') dmoBulOnbellekSifirla();
   const q = norm(document.getElementById('teslimatArama').value).toLowerCase();
   const f = document.getElementById('teslimatFiltre').value;
@@ -2820,42 +2944,67 @@ function teslimatRender() {
     return k.h[alan];
   };
   const kayitlar = [];
+  /* Ağır hesaplar (reçete/gelen/termin/ana kayıt) yalnız gerektiğinde yapılır:
+     15.000 satırın tamamı için hesaplamak sekme açılışını 1 sn'ye çıkarıyordu. */
+  const siraAlan = siralamaDurumu.teslimat && siralamaDurumu.teslimat.alan;
+  const gerekGelen = (f && f !== 'geciken' && f !== 'yaklasan')
+    || siraAlan === 'gelen' || siraAlan === 'kalan' || siraAlan === 'durum';
+  const gerekTermin = f === 'geciken' || f === 'yaklasan' || siraAlan === 'termin';
   ihaleListe.forEach((h, i) => {
-    const a = kayitAnaBilgi(h);
     if (!h.partiler) h.partiler = [];
     const toplamMiktar = Number(h.miktar) || 0;
-    const toplamGelen = h.partiler.reduce((s, p) => s + (Number(p.gelen) || 0), 0);
-    const durumBilgi = teslimDurumu(toplamMiktar, toplamGelen);
-    const terminBilgi = terminDurumu(h);
-    const hay = [a.malzeme, a.id, h.ikn, a.tasinir, h.firma, ...h.partiler.map(p => p.irsaliye)].join(' ').toLowerCase();
-    if (q && !hay.includes(q)) return;
-    if (f === 'geciken') { if (!terminBilgi.gecikti) return; }
-    else if (f === 'yaklasan') {
-      if (terminBilgi.bos || terminBilgi.gun == null) return;
-      if (!(terminBilgi.gun <= 0 && terminBilgi.gun >= -TERMIN_YAKLASAN_GUN)) return;
+    const k = { h, i, a: null, toplamMiktar, toplamGelen: 0, kalan: 0, durumBilgi: null, terminBilgi: null };
+    if (q || gerekGelen) k.a = kayitAnaBilgi(h);
+    if (gerekGelen) {
+      k.toplamGelen = h.partiler.reduce((s, p) => s + (Number(p.gelen) || 0), 0);
+      k.kalan = toplamMiktar - k.toplamGelen;
+      k.durumBilgi = teslimDurumu(toplamMiktar, k.toplamGelen);
     }
-    else if (f && durumBilgi.kisa !== f) return;
-    kayitlar.push({
-      h, i, a,
-      toplamMiktar, toplamGelen,
-      kalan: toplamMiktar - toplamGelen,
-      durumBilgi, terminBilgi
-    });
+    if (gerekTermin) k.terminBilgi = terminDurumu(h);
+    if (q) {
+      const aa = k.a || kayitAnaBilgi(h);
+      const hay = [aa.malzeme, aa.id, h.ikn, aa.tasinir, h.firma, ...h.partiler.map(p => p.irsaliye)].join(' ').toLowerCase();
+      if (!hay.includes(q)) return;
+    }
+    if (f === 'geciken') { if (!k.terminBilgi || !k.terminBilgi.gecikti) return; }
+    else if (f === 'yaklasan') {
+      const tb = k.terminBilgi;
+      if (!tb || tb.bos || tb.gun == null) return;
+      if (!(tb.gun <= 0 && tb.gun >= -TERMIN_YAKLASAN_GUN)) return;
+    }
+    else if (f && f !== '' && f !== 'geciken' && f !== 'yaklasan') {
+      if (!k.durumBilgi) {
+        k.toplamGelen = h.partiler.reduce((s, p) => s + (Number(p.gelen) || 0), 0);
+        k.durumBilgi = teslimDurumu(toplamMiktar, k.toplamGelen);
+      }
+      if (k.durumBilgi.kisa !== f) return;
+    }
+    kayitlar.push(k);
   });
   // sıralama anahtarı: gelen/kalan/durum/termin için hesaplanan değerler
   const siraliKayitlar = siraUygula(kayitlar, siralamaDurumu.teslimat, (k, alan) => {
-    if (alan === 'id') return k.a.id;
-    if (alan === 'malzeme') return k.a.malzeme;
-    if (alan === 'tasinir') return k.a.tasinir;
+    if (alan === 'id') return (k.a || kayitAnaBilgi(k.h)).id;
+    if (alan === 'malzeme') return (k.a || kayitAnaBilgi(k.h)).malzeme;
+    if (alan === 'tasinir') return (k.a || kayitAnaBilgi(k.h)).tasinir;
     if (alan === 'miktar') return k.toplamMiktar;
     if (alan === 'gelen') return k.toplamGelen;
     if (alan === 'kalan') return k.kalan;
-    if (alan === 'durum') return k.durumBilgi.ad;
+    if (alan === 'durum') return k.durumBilgi ? k.durumBilgi.ad : '';
     if (alan === 'termin') { const t = terminTarihi(k.h); return t ? t.getTime() : ''; }
     return k.h[alan];
   });
-  siraliKayitlar.forEach(k => {
-    const { h, i, a, toplamMiktar, toplamGelen, kalan, durumBilgi } = k;
+  filtreDegisti('teslimat', [q, f].join('|') + '|' + JSON.stringify(siralamaDurumu.teslimat || null));
+  const dilim = sayfaDilimi('teslimat', siraliKayitlar.length);
+  siraliKayitlar.slice(dilim.bas, dilim.bit).forEach((k, sayfaSira) => {
+    const { h, i } = k;
+    /* Görünen sayfa için eksik kalan hesaplar burada tamamlanır (en çok 500 satır). */
+    const a = k.a || kayitAnaBilgi(h);
+    if (!k.durumBilgi) {
+      k.toplamGelen = h.partiler.reduce((s, p) => s + (Number(p.gelen) || 0), 0);
+      k.kalan = k.toplamMiktar - k.toplamGelen;
+      k.durumBilgi = teslimDurumu(k.toplamMiktar, k.toplamGelen);
+    }
+    const toplamMiktar = k.toplamMiktar, toplamGelen = k.toplamGelen, kalan = k.kalan, durumBilgi = k.durumBilgi;
     const dmoAdet = dmoTeslimat.length ? dmoKayitlariBul(h).satirlar.length : 0;
     const dmoSatirVar = dmoAdet > 0;
     const dmoBaslik = dmoAdet ? `DMO: ${dmoAdet} sipariş/teslimat satırı` : 'DMO Sipariş Detaylarını Gör';
@@ -2868,7 +3017,7 @@ function teslimatRender() {
       : durumBilgi.kisa === 'asiri' ? 'ihale-iptal'
       : 'ihale-bekle';
     let rowHtml = `
-      <td>${goster}</td>
+      <td>${dilim.bas + sayfaSira + 1}</td>
       <td>${esc(a.id) || '<span style="color:#dc2626;">YOK</span>'}</td>
       <td>${esc(a.malzeme)}</td>
       <td style="font-family:monospace;font-size:11px;">${esc(a.tasinir)}</td>
@@ -2913,7 +3062,8 @@ function teslimatRender() {
   tbody.innerHTML = goster === 0
     ? `<tr><td colspan="${15 + maxPartiGlobal}"><div class="empty-state"><h3>Kayıt yok</h3></div></td></tr>`
     : satirHtml.join('');
-  document.getElementById('teslimatAdetBadge').textContent = ihaleListe.length + ' sipariş';
+  document.getElementById('teslimatAdetBadge').textContent = ihaleListe.length.toLocaleString('tr-TR') + ' sipariş';
+  sayfalamaCiz('teslimatSayfalama', 'teslimat', siraliKayitlar.length);
   siraIsaretle('teslimat');
   terminOzetiRender();
   if (typeof dmoTeslimatRozetiGuncelle === 'function') dmoTeslimatRozetiGuncelle();
@@ -3003,8 +3153,11 @@ function sekme(ad, btn) {
   btn.classList.add('active');
   if (ad === 'rapor') raporRender();
   if (ad === 'gunluk') gunlukRender();
-  if (ad === 'yuklenen') dmoAktarimlariniRender();
+  if (ad === 'yuklenen') { yuklenenIhaleleriRender(); dmoAktarimlariniRender(); }
   if (ad === 'dmois') dmoIsListesiRender();
+  /* Veri değiştiğinde çizilmeyen tablolar burada tazelenir. */
+  const tablo = SEKME_TABLO[ad];
+  if (tablo) { kirliSekmeler.delete(tablo); SAYFA_RENDER[tablo](); }
 }
 
 /* ============================================================
@@ -3649,6 +3802,8 @@ function gunlukHizli(gun) {
   gunlukRender();
 }
 function gunlukRender() {
+  if (!sekmeAktifMi('gunluk')) { kirliSekmeler.add('gunluk'); return; }
+  kirliSekmeler.delete('gunluk');
   const tbody = document.getElementById('gunlukTbody');
   if (!tbody) return;
   const kayitlar = gunlukKayitlari();
@@ -3928,6 +4083,8 @@ function fiyatDegisimEtiketi(yuzde) {
   return `<span style="color:${renk};font-weight:600;">${isaret}${yuzde.toLocaleString('tr-TR', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%</span>`;
 }
 function raporRender() {
+  if (!sekmeAktifMi('rapor')) { kirliSekmeler.add('rapor'); return; }
+  kirliSekmeler.delete('rapor');
   const alan = document.getElementById('raporAlan');
   const badge = document.getElementById('raporAdetBadge');
   if (!alan) return;
@@ -4189,6 +4346,8 @@ function temizle() {
    YÜKLENEN İHALE LİSTELERİ RENDER VE SİLME (YENİ)
 ============================================================ */
 function yuklenenIhaleleriRender() {
+  if (!sekmeAktifMi('yuklenen')) { kirliSekmeler.add('yuklenen'); return; }
+  kirliSekmeler.delete('yuklenen');
   const tbody = document.getElementById('yuklenenIhalelerTbody');
   if (!tbody) return;
 
@@ -6256,6 +6415,8 @@ function dmoIsSatirlari() {
   });
 }
 function dmoIsListesiRender() {
+  if (!sekmeAktifMi('dmois')) { kirliSekmeler.add('dmois'); return; }
+  kirliSekmeler.delete('dmois');
   const tbody = document.getElementById('dmoIsTbody');
   if (!tbody) return;
   const q = trLower((document.getElementById('dmoIsArama') || {}).value || '');
@@ -6636,6 +6797,8 @@ function dmoMalzemeGoster(anaIdx) {
   document.getElementById('dmoDetayModal').style.display = 'flex';
 }
 function dmoAktarimlariniRender() {
+  if (!sekmeAktifMi('yuklenen')) { kirliSekmeler.add('yuklenen'); return; }
+  kirliSekmeler.delete('yuklenen');
   const tbody = document.getElementById('dmoAktarimTbody');
   if (!tbody) return;
   tbody.innerHTML = '';
