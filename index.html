@@ -1576,9 +1576,11 @@ const FB_YOL = 'ihaleVerisi';
 function fbHazirMi() { return !!(window._fb && window._fbHazir); }
 
 function fbHepsiniYaz(ana, ihale, stok) {
-  const { db, ref, set } = window._fb;
+  /* update kullanılır: aynı düğüm altında duran değişiklik günlüğü
+     (degisiklikLog) set() ile silinmesin. */
+  const { db, ref, update } = window._fb;
   const dmoVeri = dmoAktarimlari.map(dmoAktarimObj);
-  return set(ref(db, FB_YOL), {
+  return update(ref(db, FB_YOL), {
     ana_liste: ana,
     ihale_liste: ihale,
     stok_map: stok,
@@ -3224,8 +3226,13 @@ function tarihDamga() {
    Tarayıcıda çevrimdışı kopya bulunur.
 ============================================================ */
 const LOG_ANAHTAR = 'ihale_takip_log';
-const LOG_FB_YOL = 'degisiklikLog';
-const LOG_FB_META = 'degisiklikLogMeta';
+/* Günlük, verinin kendisiyle aynı düğümün altında tutulur: Firebase
+   kuralları yalnızca bu yola yazmaya izin veriyor olsa bile çalışır. */
+const LOG_FB_YOL = FB_YOL + '/degisiklikLog';
+const LOG_FB_META = FB_YOL + '/degisiklikLogMeta';
+/* Önceki sürümün üst düzey yolu: varsa bir kez devralınır. */
+const LOG_FB_ESKI_YOL = 'degisiklikLog';
+const LOG_FB_ESKI_META = 'degisiklikLogMeta';
 const LOG_EN_FAZLA = 3000;
 const LOG_TIP_SINIFI = {
   'Yükleme': 'info', 'Sevk': 'ok', 'İD': 'group', 'Termin': 'period', 'DMO': 'dmo',
@@ -3376,6 +3383,7 @@ async function logSunucudanYukle() {
   logEksikleriGonder(sunucuIdler, temizlendi);
   /* Giriş öncesi biriken kayıtları gönder. */
   if (logKuyrugu.length) logGonder();
+  logEskiYoluDevral();
   if (eklenen) gunlukRender();
   return eklenen;
 }
@@ -3397,6 +3405,31 @@ function logEksikleriGonder(sunucuIdler, temizlendi) {
       console.warn('Günlük geçmişi sunucuya yazılamadı:', err);
     });
   })();
+}
+/* Önceki sürümün üst düzey günlüğünü (yazılabilmişse) bir kez devralır. */
+const logEskiDevralma = { denendi: false };
+async function logEskiYoluDevral() {
+  if (!fbHazirMi() || logEskiDevralma.denendi) return;
+  logEskiDevralma.denendi = true;
+  const { db, ref, get, update, set } = window._fb;
+  try {
+    const snap = await get(ref(db, LOG_FB_ESKI_YOL));
+    const data = snap.val() || {};
+    const kayitlar = Object.keys(data)
+      .map(id => ({ ...data[id], _id: (data[id] && data[id]._id) || id }))
+      .filter(k => k && k.zaman);
+    if (!kayitlar.length) return;
+    kayitlar.forEach(logKayitEkle);
+    const govde = {};
+    kayitlar.forEach(function(k) { govde[k._id] = k; });
+    await update(ref(db, LOG_FB_YOL), govde);
+    await set(ref(db, LOG_FB_ESKI_YOL), null);
+    try { await set(ref(db, LOG_FB_ESKI_META), null); } catch (e) {}
+    gunlukRender();
+    console.log('Eski günlük yolu devralındı:', kayitlar.length, 'kayıt');
+  } catch (err) {
+    /* Eski yol okunamıyorsa (kural yok) sorun değil; sessizce geç. */
+  }
 }
 /* Diğer tarayıcılarda eklenen kayıtları canlı olarak alır. */
 function logCanliDinle() {
@@ -3583,6 +3616,7 @@ function gunlukTemizle() {
         kullanici: (window._fbKullanici && window._fbKullanici.email) || ''
       }).catch(function(err) { console.warn('Günlük temizleme bilgisi yazılamadı:', err); });
       set(ref(db, LOG_FB_YOL), null).catch(function(err) { console.warn('Sunucu günlüğü temizlenemedi:', err); });
+      try { set(ref(db, LOG_FB_ESKI_YOL), null); set(ref(db, LOG_FB_ESKI_META), null); } catch (e) {}
     } catch (e) {}
   }
   alert('Günlük temizlendi.');
