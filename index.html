@@ -1502,8 +1502,16 @@ function anaSatirObj(a) {
     talepMiktar: a.talepMiktar ?? '', onayMiktar: a.onayMiktar ?? ''
   };
 }
+/* `oncekiVeriler` tüm ihale listesinin kopyası olan büyük bir JSON'dur.
+   Her kayıtta yeniden serileştirmemek için nesne başına bir kez hesaplanır. */
+const dmoAktarimSeri = new WeakMap();
 function dmoAktarimObj(a) {
-  return { id: a.id || '', dosyaAdi: a.dosyaAdi || '', tarih: a.tarih || '', malzemeSayisi: a.malzemeSayisi || 0, oncekiVeriler: JSON.stringify(a.oncekiVeriler || {}) };
+  let seri = dmoAktarimSeri.get(a);
+  if (seri === undefined) {
+    seri = JSON.stringify(a.oncekiVeriler || {});
+    dmoAktarimSeri.set(a, seri);
+  }
+  return { id: a.id || '', dosyaAdi: a.dosyaAdi || '', tarih: a.tarih || '', malzemeSayisi: a.malzemeSayisi || 0, oncekiVeriler: seri };
 }
 /* DMO teslimat satırı: hızlı erişim alanları + tüm sütunlar (sıralı) */
 function dmoTeslimatObj(r) {
@@ -1551,6 +1559,12 @@ const KAYDET_GECIKME = 1500;
 let kaydetTimer = null;
 let kaydetCalisiyor = false;
 let kaydetTekrar = false;
+let yerelTimer = null;
+let sonImzalar = null;       // son okunan/yazılan tablo imzaları
+let sonYazilanZaman = 0;     // kendi yazdığımız sonGuncelleme (echo'yu atlamak için)
+let sonGorulenZaman = 0;     // canlı dinleyiciden görülen son sürüm
+let canliBekliyor = false;   // yerel kayıt sürerken gelen uzak değişiklik
+let canliYenileniyor = false;
 let bosYazmaIzinleri = {};
 /* Sunucudan hangi tabloların gerçekten okunabildiğini tutar.
    Okunamayan tablo boşsa yazılmaz; böylece geçici hata veri silmez. */
@@ -1563,10 +1577,24 @@ function kaydetDurum(mesaj, tur) {
   el.style.color = tur === 'err' ? '#fecaca' : tur === 'warn' ? '#fde68a' : 'rgba(255,255,255,.7)';
   el.title = mesaj + ' (tıklayarak hemen kaydedebilirsiniz)';
 }
+/* Tarayıcı kopyası: her tuş vuruşunda 1 MB'lık JSON yazmamak için
+   geciktirilir, sekme kapanırken/gizlenirken hemen yazılır. */
 function yerelKaydet() {
+  if (yerelTimer) return;
+  yerelTimer = setTimeout(function() { yerelTimer = null; yerelKaydetHemen(); }, 2500);
+}
+function yerelKaydetHemen() {
+  if (yerelTimer) { clearTimeout(yerelTimer); yerelTimer = null; }
   try {
     localStorage.setItem('ihale_takip_v5', JSON.stringify({ anaListe, ihaleListe, stokMap, dmoTeslimat }));
-  } catch(e) {}
+  } catch(e) {
+    /* Kota dolarsa çevrimdışı kopyayı DMO teslimatını kırparak sakla. */
+    try {
+      localStorage.setItem('ihale_takip_v5', JSON.stringify({
+        anaListe, ihaleListe, stokMap, dmoTeslimat: dmoTeslimat.slice(0, 500)
+      }));
+    } catch(e2) {}
+  }
 }
 /* ============================================================
    FIREBASE KÖPRÜSÜ (gasCagir, gasVeriYaz, gasVeriOku yerine)
@@ -1575,18 +1603,67 @@ const FB_YOL = 'ihaleVerisi';
 
 function fbHazirMi() { return !!(window._fb && window._fbHazir); }
 
-function fbHepsiniYaz(ana, ihale, stok) {
-  /* update kullanılır: aynı düğüm altında duran değişiklik günlüğü
-     (degisiklikLog) set() ile silinmesin. */
+/* Her tablonun içerik imzası. Değişmeyen tablo sunucuya yeniden yazılmaz:
+   küçük bir düzenlemede tüm veri seti (ve DMO aktarım yedekleri) gönderilmez. */
+function fbImza(deger) {
+  const s = JSON.stringify(deger) || '';
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h * 0x01000193) >>> 0;
+  }
+  return h.toString(36) + ':' + s.length;
+}
+function kayitYukleri() {
+  const yukler = {
+    ana_liste: anaListe.map(anaSatirObj),
+    ihale_liste: ihaleListe.map(ihaleSatirObj),
+    stok_map: Object.entries(stokMap).map(([k, v]) => ({ tasinir: k, id: v.id ?? '', kaynak: v.kaynak ?? '' })),
+    dmo_aktarimlari: dmoAktarimlari.map(dmoAktarimObj),
+    dmo_teslimat: dmoTeslimat.map(dmoTeslimatObj)
+  };
+  /* `dmo_aktarimlari` içindeki oncekiVeriler metinleri büyük olduğu için
+     yeniden serileştirilmeden, uzunluk + kimlik ile imzalanır. */
+  const imzalar = {
+    ana_liste: fbImza(yukler.ana_liste),
+    ihale_liste: fbImza(yukler.ihale_liste),
+    stok_map: fbImza(yukler.stok_map),
+    dmo_teslimat: fbImza(yukler.dmo_teslimat),
+    dmo_aktarimlari: yukler.dmo_aktarimlari.map(function(o) {
+      return [o.id, o.dosyaAdi, o.tarih, o.malzemeSayisi, o.oncekiVeriler.length].join('|');
+    }).join('~')
+  };
+  return { yukler, imzalar };
+}
+/* Sunucudan gelen içerik "yazılmış" kabul edilir: dokunulmayan tablo geri yazılmaz. */
+function imzalariSakla() {
+  try { sonImzalar = kayitYukleri().imzalar; } catch (e) { sonImzalar = null; }
+}
+/* Sadece içeriği değişen tabloları tek istekte yazar.
+   Hiçbiri değişmediyse ağ isteği atılmaz. */
+function fbHepsiniYaz(yukler, imzalar) {
   const { db, ref, update } = window._fb;
-  const dmoVeri = dmoAktarimlari.map(dmoAktarimObj);
-  return update(ref(db, FB_YOL), {
-    ana_liste: ana,
-    ihale_liste: ihale,
-    stok_map: stok,
-    dmo_aktarimlari: dmoVeri,
-    dmo_teslimat: dmoTeslimat.map(dmoTeslimatObj),
-    sonGuncelleme: Date.now()
+  const govde = {};
+  let degisen = 0;
+  Object.keys(yukler).forEach(function(t) {
+    if (sonImzalar && sonImzalar[t] === imzalar[t]) return;
+    govde[t] = yukler[t];
+    degisen++;
+  });
+  if (!degisen) return Promise.resolve(0);
+  const zaman = Date.now();
+  govde.sonGuncelleme = zaman;
+  /* Echo koruması: yazma isteği gönderilmeden önce işaretlenir, aksi halde
+     Firebase'in yerel yazma olayı tüm veriyi geri indirir. */
+  const oncekiYazilan = sonYazilanZaman;
+  sonYazilanZaman = zaman;
+  sonGorulenZaman = Math.max(sonGorulenZaman, zaman);
+  return update(ref(db, FB_YOL), govde).then(function() {
+    sonImzalar = imzalar;
+    return degisen;
+  }).catch(function(err) {
+    if (sonYazilanZaman === zaman) sonYazilanZaman = oncekiYazilan;
+    throw err;
   });
 }
 /* Değişiklikleri 1,5 sn bekletip tek seferde yazar (Sheets kotasını korur). */
@@ -1614,14 +1691,9 @@ async function kaydetHemen() {
   }
 
   try {
-    const anaVeri   = anaListe.map(anaSatirObj);
-    const ihaleVeri = ihaleListe.map(ihaleSatirObj);
-    const stokVeri  = Object.entries(stokMap).map(([k,v]) => ({
-      tasinir: k, id: v.id ?? '', kaynak: v.kaynak ?? ''
-    }));
-
-    await fbHepsiniYaz(anaVeri, ihaleVeri, stokVeri);
-    kaydetDurum('✅ Firebase\'e kaydedildi', 'ok');
+    const { yukler, imzalar } = kayitYukleri();
+    const degisen = await fbHepsiniYaz(yukler, imzalar);
+    kaydetDurum(degisen ? '✅ Firebase\'e kaydedildi' : '✅ Değişiklik yok', 'ok');
   } catch (err) {
     kaydetDurum('❌ ' + (err.message || err) + ' — 10 sn sonra tekrar', 'err');
     if (kaydetTimer) clearTimeout(kaydetTimer);
@@ -1629,10 +1701,19 @@ async function kaydetHemen() {
   } finally {
     kaydetCalisiyor = false;
     if (kaydetTekrar) { kaydetTekrar = false; kaydetHemen(); }
+    else if (canliBekliyor) { canliBekliyor = false; canliTablolariYenile(); }
   }
 }
 document.addEventListener('visibilitychange', function() {
-  if (document.visibilityState === 'hidden' && kaydetTimer) kaydetHemen();
+  if (document.visibilityState === 'hidden') {
+    if (kaydetTimer) kaydetHemen();
+    yerelKaydetHemen();
+    logYerelKaydetHemen();
+  }
+});
+window.addEventListener('pagehide', function() {
+  yerelKaydetHemen();
+  logYerelKaydetHemen();
 });
 
 /* ============================================================
@@ -1645,16 +1726,32 @@ function doluSatirlar(liste) {
   return (liste || []).filter(o => o && typeof o === 'object' &&
     Object.keys(o).some(k => o[k] !== '' && o[k] !== null && o[k] !== undefined));
 }
+const FB_TABLOLAR = ['ana_liste', 'ihale_liste', 'stok_map', 'dmo_teslimat', 'dmo_aktarimlari'];
+/* Tablolar ayrı ayrı okunur: değişiklik günlüğü veri indirmesine dâhil
+   edilmez ve küçük yanıtlar daha hızlı iner. */
+async function fbTablolariOku() {
+  const { db, ref, get } = window._fb;
+  const cevaplar = await Promise.all(
+    FB_TABLOLAR.map(t => get(ref(db, FB_YOL + '/' + t)))
+      .concat([get(ref(db, FB_YOL + '/sonGuncelleme'))])
+  );
+  const data = {};
+  FB_TABLOLAR.forEach(function(t, i) {
+    const v = cevaplar[i].val();
+    if (v !== null && v !== undefined) data[t] = v;
+  });
+  const zaman = cevaplar[FB_TABLOLAR.length].val();
+  if (typeof zaman === 'number') data.sonGuncelleme = zaman;
+  return data;
+}
 async function sunucudanYukle() {
   const hatalar = [], kurtarilan = [];
   if (!fbHazirMi()) {
     return { hatalar: ['Firebase henüz hazır değil'], kurtarilan: ['ana_liste','ihale_liste','stok_map'] };
   }
-  const { db, ref, get } = window._fb;
 
   try {
-    const snap = await get(ref(db, FB_YOL));
-    const data = snap.val() || {};
+    const data = await fbTablolariOku();
 
     // ANA LİSTE
     if (Array.isArray(data.ana_liste) && doluSatirlar(data.ana_liste).length) {
@@ -1702,6 +1799,11 @@ async function sunucudanYukle() {
 
     dmoVeriGecersiz();
     anaIdxleriYenile();
+    /* Sunucudan gelen içerik yazılmış sayılır; değişmeyen tablo geri gönderilmez. */
+    sonGorulenZaman = data.sonGuncelleme || 0;
+    imzalariSakla();
+    /* Sunucu boş döndüyse yerel kopya geri yazılmalı: imza engeli kaldırılır. */
+    if (kurtarilan.length) sonImzalar = null;
   } catch (err) {
     hatalar.push('Firebase okuma: ' + (err.message || err));
   }
@@ -2267,37 +2369,42 @@ function hafizaRender() {
     }
   });
   let goster = 0;
+  const satirHtml = [];
   const entries = Object.entries(birlesik);
+  /* taşınır (boşluksuz) → ana kayıt: döngü içinde anaListe.find O(n²) yapıyordu. */
+  const anaHarita = {};
+  anaListe.forEach(a => {
+    const t = a.tasinir ? a.tasinir.replace(/\s/g, '') : '';
+    if (t && !anaHarita[t]) anaHarita[t] = a;
+  });
   const hafizaSiraDeger = (e, alan) => {
     const [tas, v] = e;
     if (alan === 'tasinir') return tas;
     if (alan === 'id') return v.id;
     if (alan === 'kaynak') return v.kaynak;
     if (alan === 'malzeme') {
-      const m = anaListe.find(a => a.tasinir && a.tasinir.replace(/\s/g,'') === tas);
+      const m = anaHarita[tas];
       return m ? m.malzeme : '';
     }
     return '';
   };
   siraUygula(entries, siralamaDurumu.hafiza, hafizaSiraDeger).forEach(([tas, v]) => {
-    const anaMal = anaListe.find(a => a.tasinir && a.tasinir.replace(/\s/g,'') === tas);
+    const anaMal = anaHarita[tas];
     const hay = [tas, v.id, anaMal && anaMal.malzeme].join(' ').toLowerCase();
     if (q && !hay.includes(q)) return;
     goster++;
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
+    satirHtml.push(`<tr>
       <td>${goster}</td>
       <td style="font-family:monospace;font-size:11px;">${esc(tas)}</td>
       <td><b>${esc(v.id)}</b></td>
       <td><span class="badge ${v.kaynak==='stok'?'info':'ok'}">${esc(v.kaynak)}</span></td>
       <td>${anaMal ? esc(anaMal.malzeme) : '<span style="color:#94a3b8;">(ana listede yok)</span>'}</td>
       <td><button class="btn-mini red" onclick="hafizaSil('${esc(tas)}')">×</button></td>
-    `;
-    tbody.appendChild(tr);
+    </tr>`);
   });
-  if (goster === 0) {
-    tbody.innerHTML = `<tr><td colspan="6"><div class="empty-state"><h3>Hafıza boş</h3></div></td></tr>`;
-  }
+  tbody.innerHTML = goster === 0
+    ? `<tr><td colspan="6"><div class="empty-state"><h3>Hafıza boş</h3></div></td></tr>`
+    : satirHtml.join('');
   document.getElementById('hafizaAdetBadge').textContent = entries.length + ' kayıt';
   siraIsaretle('hafiza');
 }
@@ -2373,7 +2480,6 @@ function anaRender() {
   const q = norm(document.getElementById('anaArama').value).toLowerCase();
   const f = document.getElementById('anaFiltre').value;
   const tbody = document.getElementById('anaTbody');
-  tbody.innerHTML = '';
   const kayitlar = [];
   anaListe.forEach((a, i) => {
     const hay = [a.malzeme, a.sut, a.tasinir, a.id].join(' ').toLowerCase();
@@ -2382,22 +2488,29 @@ function anaRender() {
     if (f === 'idyok' && a.id) return;
     kayitlar.push({ a, i });
   });
+  /* anaIdx → ihale kayıtları haritası: döngü içinde filter O(n×m) yapıyordu. */
+  const ihaleHaritasi = new Map();
+  ihaleListe.forEach(h => {
+    if (h.anaIdx < 0 || !anaListe[h.anaIdx]) return;
+    const dizi = ihaleHaritasi.get(h.anaIdx);
+    if (dizi) dizi.push(h); else ihaleHaritasi.set(h.anaIdx, [h]);
+  });
   const anaSiraDeger = (k, alan) => {
-    if (alan === 'ihale') return ihaleListe.filter(x => x.anaIdx === k.i).length;
+    if (alan === 'ihale') return (ihaleHaritasi.get(k.i) || []).length;
     return k.a[alan];
   };
   const sirali = siraUygula(kayitlar, siralamaDurumu.ana, anaSiraDeger);
+  const satirHtml = [];
   sirali.forEach(({ a, i }, sira) => {
-    const ihalesi = ihaleListe.filter(x => x.anaIdx === i);
+    const ihalesi = ihaleHaritasi.get(i) || [];
     const ihaleDurum = ihalesi.length === 0 ? '<span class="badge wait">Yok</span>' :
       ihalesi.some(x => /sona erdi/i.test(x.alimDurum)) ? '<span class="badge ok">Var</span>' :
       ihalesi.some(x => /iptal/i.test(x.alimDurum)) ? '<span class="badge no">İptal</span>' :
       '<span class="badge wait">?</span>';
-    const tr = document.createElement('tr');
     const dmoAdet = dmoTeslimat.length
       ? ihalesi.reduce((s, h) => s + (dmoKayitlariBul(h).satirlar || []).length, 0)
       : 0;
-    tr.innerHTML = `
+    satirHtml.push(`<tr>
       <td>${sira + 1}</td>
       <td><span class="editable-id" onclick="idDuzenle(${i}, event)" title="Tıklayarak düzenle">${esc(a.id) || '—'}</span></td>
       <td>${esc(a.malzeme)}</td>
@@ -2408,12 +2521,11 @@ function anaRender() {
       <td>${ihaleDurum}</td>
       <td><button class="btn-mini" onclick="dmoMalzemeGoster(${i})" style="background:${dmoAdet ? '#16a34a' : '#0ea5e9'}; color:#fff; border:none; padding:3px 7px; border-radius:4px; cursor:pointer;" title="Bu malzemenin tüm ihalelerindeki DMO sipariş ve teslimatları">ℹ️${dmoAdet ? ' <b>' + dmoAdet + '</b>' : ''}</button></td>
       <td><button class="btn-mini red" onclick="anaSil(${i})" title="Sil">×</button></td>
-    `;
-    tbody.appendChild(tr);
+    </tr>`);
   });
-  if (sirali.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="10"><div class="empty-state"><h3>Kayıt yok</h3></div></td></tr>`;
-  }
+  tbody.innerHTML = sirali.length
+    ? satirHtml.join('')
+    : `<tr><td colspan="10"><div class="empty-state"><h3>Kayıt yok</h3></div></td></tr>`;
   document.getElementById('anaAdetBadge').textContent = anaListe.length + ' malzeme';
   siraIsaretle('ana');
 }
@@ -2506,18 +2618,28 @@ function filtreSecenekleriGuncelle() {
   // Önce bilinenleri sabit sırayla göster (varsa)
   const oncelikli = ['İhale Sona Erdi', 'İhale İptal'];
   const kalanlar = [...durumlar].filter(d => !oncelikli.includes(d)).sort((a,b) => a.localeCompare(b, 'tr'));
+  /* Durum başına adet: her seçenek için listeyi yeniden taramamak gerekir. */
+  const durumAdet = {};
+  ihaleListe.forEach(h => {
+    const d = norm(h.alimDurum);
+    if (d) durumAdet[d] = (durumAdet[d] || 0) + 1;
+  });
   [...oncelikli, ...kalanlar].forEach(d => {
     if (!durumlar.has(d)) return;
     const o = document.createElement('option');
     o.value = d;
-    o.textContent = d + ' (' + ihaleListe.filter(h => norm(h.alimDurum) === d).length + ')';
+    o.textContent = d + ' (' + (durumAdet[d] || 0) + ')';
     durumSelect.appendChild(o);
   });
   // "Henüz İhale Yok" özel seçeneği
-  const oBekle = document.createElement('option');
-  oBekle.value = '__bekle__';
-  oBekle.textContent = 'Henüz İhale Yok (' + anaListe.filter((a,i) => !ihaleListe.some(h => h.anaIdx === i)).length + ')';
-  durumSelect.appendChild(oBekle);
+  {
+    const bagli = new Set();
+    ihaleListe.forEach(h => { if (h.anaIdx >= 0 && anaListe[h.anaIdx]) bagli.add(h.anaIdx); });
+    const oBekle = document.createElement('option');
+    oBekle.value = '__bekle__';
+    oBekle.textContent = 'Henüz İhale Yok (' + (anaListe.length - bagli.size) + ')';
+    durumSelect.appendChild(oBekle);
+  }
   durumSelect.value = curDurumVal;
 }
 
@@ -2533,10 +2655,16 @@ function ihaleRender() {
   const fGrup = document.getElementById('filterGrup').value;
   const fDurum = document.getElementById('ihaleFiltre').value;
   const tbody = document.getElementById('ihaleTbody');
-  tbody.innerHTML = '';
+  /* anaIdx → ihale kayıtları haritası: iç içe filter (O(n×m)) yerine O(n+m). */
+  const ihaleHaritasi = new Map();
+  ihaleListe.forEach(h => {
+    if (h.anaIdx < 0 || !anaListe[h.anaIdx]) return;
+    const dizi = ihaleHaritasi.get(h.anaIdx);
+    if (dizi) dizi.push(h); else ihaleHaritasi.set(h.anaIdx, [h]);
+  });
   const satirlar = [];
   anaListe.forEach((a, i) => {
-    const ihaleler = ihaleListe.filter(x => x.anaIdx === i);
+    const ihaleler = ihaleHaritasi.get(i) || [];
     if (ihaleler.length === 0) {
       if (fYil || fDonem || fAy || fGrup) return;
       satirlar.push({ ana: a, anaIdx: i, ihale: null });
@@ -2550,6 +2678,7 @@ function ihaleRender() {
     satirlar.push({ ana: kayitAnaBilgi(h), anaIdx: -1, ihale: h, ihaleIdx: hi, baglantisiz: true });
   });
   let goster = 0;
+  const satirHtml = [];
   const ihaleSiraDeger = (s, alan) => {
     if (alan === 'id') return s.ana.id;
     if (alan === 'malzeme') return s.ana.malzeme;
@@ -2580,12 +2709,12 @@ function ihaleRender() {
       /sona erdi/i.test(h.alimDurum) ? '<span class="badge ok">' + esc(h.alimDurum) + '</span>' :
       /iptal/i.test(h.alimDurum) ? '<span class="badge no">' + esc(h.alimDurum) + '</span>' :
       '<span class="badge wait">' + esc(h.alimDurum || '-') + '</span>';
-    const tr = document.createElement('tr');
-    if (s.baglantisiz) tr.className = 'ihale-iptal';
-    else if (!h) tr.className = 'ihale-bekle';
-    else if (/sona erdi/i.test(h.alimDurum)) tr.className = 'ihale-var';
-    else if (/iptal/i.test(h.alimDurum)) tr.className = 'ihale-iptal';
-    tr.innerHTML = `
+    let sinif = '';
+    if (s.baglantisiz) sinif = 'ihale-iptal';
+    else if (!h) sinif = 'ihale-bekle';
+    else if (/sona erdi/i.test(h.alimDurum)) sinif = 'ihale-var';
+    else if (/iptal/i.test(h.alimDurum)) sinif = 'ihale-iptal';
+    satirHtml.push(`${sinif ? `<tr class="${sinif}">` : '<tr>'}
       <td>${goster}</td>
       <td>${esc(a.id) || '<span style="color:#dc2626;">YOK</span>'}</td>
       <td>${esc(a.malzeme)}${s.baglantisiz ? ' <span class="badge no" title="Taşınır kodu Ana Liste\'de yok. Ana listeye eklenirse otomatik bağlanır.">bağlantısız</span>' : ''}</td>
@@ -2603,12 +2732,11 @@ function ihaleRender() {
       <td>${h ? esc(h.firma) : ''}${h && h.urun ? '<span class="firma-info">' + esc(h.urun) + '</span>' : ''}</td>
       <td class="num">${h && h.fiyat !== '' ? Number(h.fiyat).toLocaleString('tr-TR',{minimumFractionDigits:4,maximumFractionDigits:4}) : ''}</td>
       <td>${durum}</td>
-    `;
-    tbody.appendChild(tr);
+    </tr>`);
   });
-  if (goster === 0) {
-    tbody.innerHTML = `<tr><td colspan="17"><div class="empty-state"><h3>Kayıt yok</h3></div></td></tr>`;
-  }
+  tbody.innerHTML = goster === 0
+    ? `<tr><td colspan="17"><div class="empty-state"><h3>Kayıt yok</h3></div></td></tr>`
+    : satirHtml.join('');
   document.getElementById('ihaleAdetBadge').textContent = ihaleListe.length + ' ihale satırı';
   const baglantisiz = baglantisizIhaleSayisi();
   if (baglantisiz > 0) {
@@ -2682,6 +2810,7 @@ function teslimatRender() {
   const tbody = document.getElementById('teslimatTbody');
   tbody.innerHTML = '';
   let goster = 0;
+  const satirHtml = [];
   const teslimatSiraDeger = (k, alan) => {
     if (alan === 'id') return k.a.id;
     if (alan === 'malzeme') return k.a.malzeme;
@@ -2734,11 +2863,10 @@ function teslimatRender() {
     const maxParti = Math.max(maxPartiMap[h.anaIdx] || 1, h.partiler.length);
     const durum = durumBilgi.ad, durumCls = durumBilgi.cls;
     goster++;
-    const tr = document.createElement('tr');
-    if (durumBilgi.kisa === 'tamam') tr.className = 'ihale-var';
-    else if (durumBilgi.kisa === 'kismi') tr.className = 'partial';
-    else if (durumBilgi.kisa === 'asiri') tr.className = 'ihale-iptal';
-    else tr.className = 'ihale-bekle';
+    const satirSinifi = durumBilgi.kisa === 'tamam' ? 'ihale-var'
+      : durumBilgi.kisa === 'kismi' ? 'partial'
+      : durumBilgi.kisa === 'asiri' ? 'ihale-iptal'
+      : 'ihale-bekle';
     let rowHtml = `
       <td>${goster}</td>
       <td>${esc(a.id) || '<span style="color:#dc2626;">YOK</span>'}</td>
@@ -2780,12 +2908,11 @@ function teslimatRender() {
     const bosParti = maxPartiGlobal - maxParti;
     for (let p = 0; p < bosParti; p++) rowHtml += `<td style="background:#f1f5f9;"></td>`;
     rowHtml += `<td><button class="btn-mini green" onclick="partiEkle(${i})" title="Yeni parti ekle">+ Parti</button></td>`;
-    tr.innerHTML = rowHtml;
-    tbody.appendChild(tr);
+    satirHtml.push(`<tr class="${satirSinifi}">${rowHtml}</tr>`);
   });
-  if (goster === 0) {
-    tbody.innerHTML = `<tr><td colspan="${15 + maxPartiGlobal}"><div class="empty-state"><h3>Kayıt yok</h3></div></td></tr>`;
-  }
+  tbody.innerHTML = goster === 0
+    ? `<tr><td colspan="${15 + maxPartiGlobal}"><div class="empty-state"><h3>Kayıt yok</h3></div></td></tr>`
+    : satirHtml.join('');
   document.getElementById('teslimatAdetBadge').textContent = ihaleListe.length + ' sipariş';
   siraIsaretle('teslimat');
   terminOzetiRender();
@@ -2918,12 +3045,16 @@ function excelIndir(wb, ws, sayfaAdi, dosyaAdi) {
 }
 function anaExcelIndir() {
   if (!anaListe.length) { alert('Liste boş'); return; }
+  const ihaleSayisi = new Map();
+  ihaleListe.forEach(h => {
+    if (h.anaIdx < 0) return;
+    ihaleSayisi.set(h.anaIdx, (ihaleSayisi.get(h.anaIdx) || 0) + 1);
+  });
   const data = anaListe.map((a, i) => {
-    const ihalesi = ihaleListe.filter(x => x.anaIdx === i);
     return {
       '#': i+1, 'Malzeme Tanımı': a.malzeme, 'Sut Kodu': a.sut, 'Taşınır Kodu': a.tasinir,
       'İD': a.id, 'Talep Miktarı': a.talepMiktar, 'Onay Miktarı': a.onayMiktar,
-      'İhale Sayısı': ihalesi.length
+      'İhale Sayısı': ihaleSayisi.get(i) || 0
     };
   });
   const ws = XLSX.utils.json_to_sheet(data);
@@ -2933,8 +3064,14 @@ function anaExcelIndir() {
 function ihaleExcelIndir() {
   if (!anaListe.length) { alert('Liste boş'); return; }
   const satirlar = [];
+  const ihaleHaritasi = new Map();
+  ihaleListe.forEach(h => {
+    if (h.anaIdx < 0 || !anaListe[h.anaIdx]) return;
+    const dizi = ihaleHaritasi.get(h.anaIdx);
+    if (dizi) dizi.push(h); else ihaleHaritasi.set(h.anaIdx, [h]);
+  });
   anaListe.forEach((a, i) => {
-    const ihaleler = ihaleListe.filter(x => x.anaIdx === i);
+    const ihaleler = ihaleHaritasi.get(i) || [];
     if (ihaleler.length === 0) {
       satirlar.push({
         'Malzeme Tanımı': a.malzeme, 'Sut Kodu': a.sut, 'Taşınır Kodu': a.tasinir, 'Barkod': '', 'İD': a.id,
@@ -3246,11 +3383,17 @@ let logGonderiliyor = false;
 let logDinleKapat = null;
 let logMetaKapat = null;
 let logTemizlendiZaman = '';
+let logYerelTimer = null;
 
 function logYeniId() {
   return 'L' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 }
 function logYerelKaydet() {
+  if (logYerelTimer) return;
+  logYerelTimer = setTimeout(function() { logYerelTimer = null; logYerelKaydetHemen(); }, 2500);
+}
+function logYerelKaydetHemen() {
+  if (logYerelTimer) { clearTimeout(logYerelTimer); logYerelTimer = null; }
   try { localStorage.setItem(LOG_ANAHTAR, JSON.stringify(degisiklikLog.slice(0, LOG_EN_FAZLA))); } catch(e) {}
 }
 function logYereldenYukle() {
@@ -4350,6 +4493,11 @@ function oturumKapandi() {
   fbDinlemeyiDurdur();
   logDinlemeyiDurdur();
   if (logTekrarTimer) { clearTimeout(logTekrarTimer); logTekrarTimer = null; }
+  /* Yeni oturum temiz başlasın: imza/canlı dinleme durumu sıfırlanır. */
+  sonImzalar = null;
+  sonYazilanZaman = 0;
+  sonGorulenZaman = 0;
+  canliBekliyor = false;
   window._fbHazir = false;
   window._fbKullanici = null;
   oturumIzleBaslat();
@@ -4479,17 +4627,31 @@ function oturumIzleBaslat() {
   // Olay kaçırılırsa diye durumu sürekli yokla (giriş yapana kadar).
   oturumIzleBaslat();
 })();
+/* Canlı dinleme yalnızca `sonGuncelleme` üzerinde yapılır:
+   - değişiklik günlüğü yazımları bu dinleyiciyi tetiklemez,
+   - kendi yazdığımız veri geri indirilmez (echo yok),
+   - veri gerçekten değiştiğinde tablolar ayrı ayrı okunur. */
 function fbCanliDinle() {
   if (!fbHazirMi()) return;
   fbDinlemeyiDurdur();
   const { db, ref, onValue } = window._fb;
-  let ilkAtla = true;
 
-  fbDinleKapat = onValue(ref(db, FB_YOL), snap => {
-    if (ilkAtla) { ilkAtla = false; return; }
-    const data = snap.val();
-    if (!data) return;
-
+  fbDinleKapat = onValue(ref(db, FB_YOL + '/sonGuncelleme'), snap => {
+    const zaman = snap.val();
+    if (typeof zaman !== 'number' || !zaman) return;
+    if (zaman === sonYazilanZaman) return;
+    if (zaman <= sonGorulenZaman) return;
+    sonGorulenZaman = zaman;
+    if (kaydetTimer || kaydetCalisiyor) { canliBekliyor = true; return; }
+    canliTablolariYenile();
+  });
+}
+/* Uzak değişikliği tablo tablo çeker ve ekranı tazeler. */
+async function canliTablolariYenile() {
+  if (!fbHazirMi() || canliYenileniyor) return;
+  canliYenileniyor = true;
+  try {
+    const data = await fbTablolariOku();
     if (Array.isArray(data.ana_liste)) anaListe = doluSatirlar(data.ana_liste);
     if (Array.isArray(data.ihale_liste)) {
       ihaleListe = doluSatirlar(data.ihale_liste)
@@ -4512,14 +4674,23 @@ function fbCanliDinle() {
         ...a, oncekiVeriler: typeof a.oncekiVeriler === 'string' ? JSON.parse(a.oncekiVeriler || '{}') : (a.oncekiVeriler || {})
       }));
     }
-
+    if (typeof data.sonGuncelleme === 'number' && data.sonGuncelleme > sonGorulenZaman) {
+      sonGorulenZaman = data.sonGuncelleme;
+    }
     anaIdxleriYenile();
     dmoVeriGecersiz();
+    /* Bağlantılar çözüldükten sonra imza alınır: aksi halde ilk kayıtta
+       gereksiz yazma oluşur. */
+    imzalariSakla();
     anaRender(); ihaleRender(); teslimatRender(); hafizaRender(); stokStatsRender();
     filtreSecenekleriGuncelle(); yuklenenIhaleleriRender(); raporRender();
-    
+
     kaydetDurum('☁️ Canlı güncelleme alındı', 'ok');
-  });
+  } catch (err) {
+    console.warn('Canlı güncelleme alınamadı:', err);
+  } finally {
+    canliYenileniyor = false;
+  }
 }
 
 /* ============================================================
